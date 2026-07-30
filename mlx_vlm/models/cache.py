@@ -343,6 +343,23 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def extract(self, idx):
+        cache = KVCache()
+        if self.keys is None:
+            return cache
+        batch_size = int(self.keys.shape[0])
+        if idx >= batch_size:
+            if idx == 0:
+                cache.keys = mx.contiguous(self.keys[..., : self.offset, :])
+                cache.values = mx.contiguous(self.values[..., : self.offset, :])
+                cache.offset = self.offset
+                return cache
+            raise IndexError(f"KVCache row index {idx} out of range for batch size {batch_size}")
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset, :])
+        cache.offset = cache.keys.shape[2]
+        return cache
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
@@ -834,7 +851,18 @@ class CacheList(_BaseCache):
         return cache
 
     def extract(self, idx):
-        return CacheList(*(c.extract(idx) for c in self.caches))
+        extracted = []
+        for c in self.caches:
+            extract = getattr(c, "extract", None)
+            if callable(extract):
+                extracted.append(extract(idx))
+            elif idx == 0:
+                extracted.append(c)
+            else:
+                raise AttributeError(
+                    f"{type(c).__name__} object has no attribute 'extract'"
+                )
+        return CacheList(*extracted)
 
     def prepare(self, **kwargs):
         for c in self.caches:
