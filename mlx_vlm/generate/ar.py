@@ -785,6 +785,8 @@ def _make_cache(
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
+        elif isinstance(c, cache.PoolingCache):
+            return cache.BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, cache.CacheList):
             return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
         elif isinstance(c, tuple):
