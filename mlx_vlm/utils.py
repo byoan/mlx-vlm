@@ -588,6 +588,13 @@ def _quantization_path_aliases(path: str) -> Tuple[str, ...]:
                     f".ffn.shared_experts.{checkpoint_name}.",
                 )
             )
+            if alias.endswith(f".ffn.shared_experts.{module_name}"):
+                aliases.append(
+                    alias[
+                        : -len(f".ffn.shared_experts.{module_name}")
+                    ]
+                    + f".ffn.shared_experts.{checkpoint_name}"
+                )
     return tuple(dict.fromkeys(aliases))
 
 
