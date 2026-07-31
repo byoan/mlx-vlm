@@ -218,7 +218,7 @@ def register_default_capabilities() -> None:
         register_capability(cls, Capability.PAGEABLE)
     for cls in (c.RotatingKVCache,):
         register_capability(cls, Capability.WINDOWED)
-    for cls in (c.ArraysCache, c.PoolingCache, c.StaticPrefixKVCache):
+    for cls in (c.ArraysCache, c.StaticPrefixKVCache):
         register_capability(cls, Capability.CHECKPOINT)
     register_capability(c.CacheList, Capability.COMPOSITE)
 
@@ -289,6 +289,8 @@ def apc_exact_eligible(cache: Any) -> bool:
     """True if ``cache`` supports exact whole-prefix snapshot APC reuse."""
     from .models import cache as c
 
+    if isinstance(cache, c.PoolingCache):
+        return False
     exact_types, _ = _apc_type_tables()
     if isinstance(cache, exact_types) or hasattr(cache, "dequantize_for_apc"):
         return True

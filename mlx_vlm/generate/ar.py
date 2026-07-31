@@ -837,7 +837,19 @@ def _append_mx_arrays(value: Any, targets: List[mx.array]) -> None:
             _append_mx_arrays(item, targets)
 
 
+def _cache_tree_contains_pooling(value: Any) -> bool:
+    if isinstance(value, (cache.PoolingCache, cache.BatchPoolingCache)):
+        return True
+    if isinstance(value, cache.CacheList):
+        return any(_cache_tree_contains_pooling(c) for c in value.caches)
+    if isinstance(value, (list, tuple)):
+        return any(_cache_tree_contains_pooling(item) for item in value)
+    return False
+
+
 def _prompt_cache_eval_targets(prompt_cache) -> List[mx.array]:
+    if _cache_tree_contains_pooling(prompt_cache):
+        return []
     targets: List[mx.array] = []
     for c in prompt_cache:
         try:
