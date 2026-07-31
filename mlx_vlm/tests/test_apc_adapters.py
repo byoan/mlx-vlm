@@ -22,7 +22,9 @@ from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchQuantizedKVCache,
     BatchRotatingKVCache,
+    CacheList,
     KVCache,
+    PoolingCache,
     QuantizedKVCache,
     RotatingKVCache,
 )
@@ -44,6 +46,26 @@ def _rand_kv(batch=B, seq_len=32, heads=H, dim=D):
 
 def _max_abs_error(a: mx.array, b: mx.array) -> float:
     return mx.max(mx.abs(a - b)).item()
+
+
+def test_snapshot_nested_pooling_cache_restores_ratio_before_buffered_state():
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+
+    pooling = PoolingCache(ratio=4)
+    kv = mx.arange(6, dtype=mx.float32).reshape(1, 3, 2)
+    gate = mx.arange(3, dtype=mx.float32).reshape(1, 3, 1)
+    pooling.accumulate_windows(kv, gate, offset=0)
+
+    snapshot = snapshot_prompt_cache_row([CacheList(pooling)], batch_idx=0)
+
+    assert snapshot is not None
+    cloned = snapshot[0][0]
+    assert isinstance(cloned, PoolingCache)
+    assert cloned.ratio == 4
+    assert cloned.remainder == 3
+    mx.eval(*[value for value in cloned.state if value is not None])
+    assert mx.array_equal(cloned.state[0], kv).item()
+    assert mx.array_equal(cloned.state[1], gate).item()
 
 
 def _fill_batch_kv(left_padding, seq_len):

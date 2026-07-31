@@ -2071,6 +2071,14 @@ class PoolingCache(_BaseCache):
     def meta_state(self, v):
         self.ratio = v
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # Restoring buffered state calls ``accumulate_windows``, which needs
+        # the compression ratio before the generic state setter can run.
+        obj = cls(meta_state)
+        obj.state = state
+        return obj
+
     def is_trimmable(self):
         return self.pooled is None
 
