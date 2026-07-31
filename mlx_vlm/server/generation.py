@@ -1755,6 +1755,7 @@ class ResponseGenerator:
 
                     try:
                         thinking_budget_criteria = request.thinking_budget_criteria
+                        request_sampler = self._make_sampler(args)
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
@@ -1763,6 +1764,8 @@ class ResponseGenerator:
                                 self._make_logits_processors(args, input_ids)
                             ],
                             thinking_budget_criteria=[thinking_budget_criteria],
+                            samplers=[request_sampler or make_sampler(temp=0)],
+                            greedy_sampling_rows=[args.temperature == 0],
                         )
                     except Exception as e:
                         rqueue.put(e)

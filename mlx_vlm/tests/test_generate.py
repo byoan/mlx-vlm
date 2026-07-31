@@ -567,6 +567,40 @@ class TestBatchGenerator:
 
         assert len(uids) == 2
 
+    def test_insert_keeps_request_local_samplers(self, mock_model, mock_processor):
+        gen = BatchGenerator(model=mock_model.language_model, processor=mock_processor)
+
+        def first_sampler(logprobs):
+            return mx.argmax(logprobs, axis=-1)
+
+        def second_sampler(logprobs):
+            return mx.argmin(logprobs, axis=-1)
+
+        gen.insert(
+            [[1, 2], [3, 4]],
+            samplers=[first_sampler, second_sampler],
+            greedy_sampling_rows=[True, False],
+        )
+
+        rows = gen.unprocessed_prompts
+        assert rows[0][6] is first_sampler
+        assert rows[1][6] is second_sampler
+        assert [row[7] for row in rows] == [True, False]
+
+    def test_request_local_samplers_choose_independent_batch_rows(self):
+        logprobs = mx.array([[0.0, 1.0, 2.0], [0.0, 1.0, 2.0]])
+
+        sampled = ar_module._sample_rows(
+            [
+                lambda row: mx.argmax(row, axis=-1),
+                lambda row: mx.argmin(row, axis=-1),
+            ],
+            logprobs,
+            positions=[0, 0],
+        )
+
+        assert sampled.tolist() == [2, 0]
+
     def test_stats(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
