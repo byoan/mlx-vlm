@@ -1961,8 +1961,6 @@ class PromptProcessingBatch:
             positions=[0] * len(self.uids),
         )
 
-        mx.async_eval(first_tokens)
-
         # Roll any right-padding into left-padding so the cache decoded by
         # GenerationBatch sees a canonical layout.
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
