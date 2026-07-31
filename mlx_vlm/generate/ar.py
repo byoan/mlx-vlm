@@ -441,7 +441,9 @@ def generate_step(
                         **kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
-                    mx.eval([c.state for c in prompt_cache])
+                    cache_targets = _prompt_cache_eval_targets(prompt_cache)
+                    if cache_targets:
+                        mx.eval(*cache_targets)
                     processed_tokens += n_to_process
                     if (
                         checkpoint_len is not None
@@ -825,6 +827,24 @@ def _can_use_single_row_prompt_cache(model) -> bool:
     return not any(
         isinstance(c, (cache.CacheList, cache.PoolingCache)) for c in model_cache
     )
+
+
+def _append_mx_arrays(value: Any, targets: List[mx.array]) -> None:
+    if isinstance(value, mx.array):
+        targets.append(value)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _append_mx_arrays(item, targets)
+
+
+def _prompt_cache_eval_targets(prompt_cache) -> List[mx.array]:
+    targets: List[mx.array] = []
+    for c in prompt_cache:
+        try:
+            _append_mx_arrays(c.state, targets)
+        except (AttributeError, TypeError):
+            pass
+    return targets
 
 
 @dataclass
@@ -1847,7 +1867,9 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.eval([c.state for c in self.prompt_cache])
+        cache_targets = _prompt_cache_eval_targets(self.prompt_cache)
+        if cache_targets:
+            mx.eval(*cache_targets)
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
@@ -2017,15 +2039,8 @@ class PromptProcessingBatch:
         # Final prefill produces the first generated token and mutates the
         # prompt cache. Materialize that boundary before the decode loop so
         # the first decode step does not inherit the full lazy prefill graph.
-        cache_states = []
-        for c in self.prompt_cache:
-            try:
-                cache_states.append(c.state)
-            except (AttributeError, TypeError):
-                pass
         eval_targets = [first_tokens]
-        if cache_states:
-            eval_targets.append(cache_states)
+        eval_targets.extend(_prompt_cache_eval_targets(self.prompt_cache))
         if compute_logprobs and isinstance(gen_batch, GenerationBatch):
             eval_targets.append(gen_batch._next_lps)
         if top_logprobs_k > 0 and isinstance(gen_batch, GenerationBatch):
@@ -2654,9 +2669,16 @@ class BatchGenerator:
             ):
                 cache_states = getattr(self._generation_batch, "cache_states", None)
                 if callable(cache_states):
-                    mx.eval(cache_states())
+                    eval_targets: List[mx.array] = []
+                    _append_mx_arrays(cache_states(), eval_targets)
+                    if eval_targets:
+                        mx.eval(*eval_targets)
                 else:
-                    mx.eval([c.state for c in self._generation_batch.prompt_cache])
+                    eval_targets = _prompt_cache_eval_targets(
+                        self._generation_batch.prompt_cache
+                    )
+                    if eval_targets:
+                        mx.eval(*eval_targets)
                 mx.clear_cache()
             if yield_after_decode:
                 return prompt_responses, generation_responses
