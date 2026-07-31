@@ -23,11 +23,35 @@ from mlx_vlm.utils import (
     load_image,
     load_model,
     load_processor,
+    materialize_model_state,
     prepare_inputs,
     process_inputs_with_fallback,
     sanitize_weights,
     update_module_configs,
 )
+
+
+def test_materialize_model_state_supports_cross_thread_deepseek_v4_use():
+    from mlx_vlm.models.deepseek_v4.language import DeepseekV4RoPE
+
+    loaded = []
+
+    def load_on_worker():
+        rope = DeepseekV4RoPE(4, 10000)
+        materialize_model_state(rope)
+        loaded.append(rope)
+
+    thread = Thread(target=load_on_worker)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive()
+    assert len(loaded) == 1
+
+    x = mx.random.uniform(shape=(1, 2, 3, 4))
+    output = loaded[0](x, offset=1)
+    mx.eval(output)
+    assert output.shape == x.shape
 
 
 class MockTensor:

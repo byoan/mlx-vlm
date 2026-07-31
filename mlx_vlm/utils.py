@@ -66,6 +66,21 @@ GENERATION_CONFIG_DEFAULT_KEYS = (
 )
 
 
+def materialize_model_state(model: Any) -> None:
+    """Evaluate every MLX array reachable from a loaded model.
+
+    ``Module.parameters()`` omits non-parameter buffers such as cached RoPE
+    frequencies.  Those arrays must also be materialized before a loaded model
+    is handed to another thread, otherwise their lazy graphs still reference
+    the loading thread's Metal stream.
+    """
+    arrays = [
+        value for _, value in tree_flatten(model) if isinstance(value, mx.array)
+    ]
+    if arrays:
+        mx.eval(*arrays)
+
+
 def apply_generation_config_defaults(model_config, config: dict):
     for key in GENERATION_CONFIG_DEFAULT_KEYS:
         if key in config:
@@ -867,7 +882,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
-        mx.eval(model.parameters())
+        materialize_model_state(model)
 
     model.model_path = model_path
     model.eval()
@@ -1050,7 +1065,7 @@ def sharded_load(
         inner.pipeline(pipeline_group)
 
     print("Materializing")
-    mx.eval(model.language_model.parameters())
+    materialize_model_state(model)
     model.eval()
 
     # Synchronize processes to avoid timeout
