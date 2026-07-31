@@ -1648,7 +1648,7 @@ class ResponseGenerator:
             self._run_speculative()
             return
 
-        generation_stream = mx.default_stream(mx.default_device())
+        generation_stream = mx.new_thread_local_stream(mx.default_device())
 
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
@@ -1939,7 +1939,7 @@ class ResponseGenerator:
         Finished sequences are filtered out automatically by the round-loop's
         ``stop_check`` callback.
         """
-        generation_stream = mx.default_stream(mx.default_device())
+        generation_stream = mx.new_thread_local_stream(mx.default_device())
 
         lm = self.model.language_model
         drafter = self.draft_model
