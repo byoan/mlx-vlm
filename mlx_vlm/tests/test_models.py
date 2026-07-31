@@ -3,6 +3,7 @@ import inspect
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -825,6 +826,14 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")
         self.assertEqual(type(cache[2]).__name__, "CacheList")
+        with patch.object(
+            deepseek_v4.language,
+            "_materialize_cache_state",
+            wraps=deepseek_v4.language._materialize_cache_state,
+        ) as materialize:
+            cached_out = model.language_model(inputs, cache=cache)
+            mx.eval(cached_out.logits)
+        materialize.assert_called_once_with(cache)
 
         weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
         converted = model.sanitize(

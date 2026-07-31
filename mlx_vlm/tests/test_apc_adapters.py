@@ -20,6 +20,7 @@ from mlx_vlm.apc import (
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchPoolingCache,
     BatchQuantizedKVCache,
     BatchRotatingKVCache,
     CacheList,
@@ -66,6 +67,29 @@ def test_snapshot_nested_pooling_cache_restores_ratio_before_buffered_state():
     mx.eval(*[value for value in cloned.state if value is not None])
     assert mx.array_equal(cloned.state[0], kv).item()
     assert mx.array_equal(cloned.state[1], gate).item()
+
+
+def test_pooling_cache_exact_batch_merge_accepts_prefix_lengths():
+    from mlx_vlm.apc_adapters import merge_cache_entries
+
+    warm = PoolingCache(ratio=4)
+    kv = mx.arange(18, dtype=mx.float32).reshape(1, 6, 3)
+    gate = mx.ones((1, 6, 2), dtype=mx.float32)
+    warm.accumulate_windows(kv, gate, offset=0)
+    warm.update_and_fetch(mx.ones((1, 1, 3), dtype=mx.float32))
+    cold = PoolingCache(ratio=4)
+
+    merged = merge_cache_entries([warm, cold], [6, 0])
+
+    assert isinstance(merged, BatchPoolingCache)
+    assert merged.remainder == [2, 0]
+    assert merged._pool_lengths == [1, 0]
+    assert merged._processed == [6, 0]
+    extracted_warm = merged.extract(0)
+    extracted_cold = merged.extract(1)
+    assert extracted_warm.remainder == 2
+    assert extracted_warm.pooled.shape == (1, 1, 3)
+    assert extracted_cold.empty()
 
 
 def _fill_batch_kv(left_padding, seq_len):

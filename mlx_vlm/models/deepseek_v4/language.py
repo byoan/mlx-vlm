@@ -56,6 +56,25 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
+def _materialize_cache_state(cache: List[Any]) -> None:
+    """Detach the lazy array chains retained by DeepSeek-V4 caches."""
+    targets = []
+    for layer_cache in cache:
+        children = (
+            layer_cache.caches
+            if isinstance(layer_cache, CacheList)
+            else (layer_cache,)
+        )
+        for child in children:
+            if child is None:
+                continue
+            targets.extend(
+                value for value in vars(child).values() if isinstance(value, mx.array)
+            )
+    if targets:
+        mx.eval(*targets)
+
+
 @mx.compile
 def _expert_select(
     logits: mx.array,
@@ -1046,6 +1065,13 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
 
         for layer, layer_cache in zip(self.pipeline_layers, cache):
             h = layer(h, mask, layer_cache, inputs)
+
+        # Pooling and rotating caches retain lazy graphs through their growing
+        # and sliced-update state.  With multiple active rows those graphs grow
+        # especially quickly and can collapse decode throughput before the
+        # generic periodic cache evaluation runs.  Materialize once per model
+        # forward (one synchronization for all layers) to keep the graph bounded.
+        _materialize_cache_state(cache)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
