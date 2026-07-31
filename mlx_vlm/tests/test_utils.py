@@ -54,6 +54,37 @@ def test_materialize_model_state_supports_cross_thread_deepseek_v4_use():
     assert output.shape == x.shape
 
 
+def test_deepseek_v4_rope_derived_frequencies_are_thread_local():
+    from mlx_vlm.models.deepseek_v4.language import DeepseekV4RoPE
+
+    rope = DeepseekV4RoPE(4, 10000)
+    materialize_model_state(rope)
+    cached_frequencies = []
+    errors = []
+
+    def use_on_generator_thread():
+        try:
+            x = mx.random.uniform(shape=(1, 2, 3, 4))
+            output = rope(x, offset=1, inverse=True)
+            mx.eval(output)
+            cached_frequencies.append(rope._freqs_cache.values[(4, True)])
+        except Exception as exc:
+            errors.append(exc)
+
+    first = Thread(target=use_on_generator_thread)
+    first.start()
+    first.join(timeout=5.0)
+    second = Thread(target=use_on_generator_thread)
+    second.start()
+    second.join(timeout=5.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert len(cached_frequencies) == 2
+    assert cached_frequencies[0] is not cached_frequencies[1]
+
+
 class MockTensor:
     def __init__(self, data):
         self.data = data

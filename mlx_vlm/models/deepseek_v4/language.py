@@ -1,5 +1,6 @@
 import math
 from functools import partial
+from threading import local
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -181,11 +182,18 @@ class DeepseekV4RoPE(nn.Module):
             raise ValueError(f"Unsupported DeepSeek-V4 RoPE type: {rope_type}")
 
         self._freqs = 1.0 / inv_freq
-        self._freqs_cache = {}
+        # A loaded model can be shared by multiple ResponseGenerator threads
+        # (for example, sampler or API-key profiles). Derived MLX arrays retain
+        # their creation stream, so they must not be cached across threads.
+        self._freqs_cache = local()
 
     def _get_freqs(self, head_dim: int, inverse: bool):
+        cache = getattr(self._freqs_cache, "values", None)
+        if cache is None:
+            cache = {}
+            self._freqs_cache.values = cache
         key = (head_dim, inverse)
-        if key not in self._freqs_cache:
+        if key not in cache:
             f = self._freqs
             if self.freq_scale != 1:
                 f = f / self.freq_scale
@@ -194,8 +202,8 @@ class DeepseekV4RoPE(nn.Module):
             nope_pairs = (head_dim - self.dims) // 2
             if nope_pairs > 0:
                 f = mx.concatenate([mx.full((nope_pairs,), mx.inf), f])
-            self._freqs_cache[key] = f
-        return self._freqs_cache[key]
+            cache[key] = f
+        return cache[key]
 
     def __call__(
         self,
