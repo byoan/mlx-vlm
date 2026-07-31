@@ -566,6 +566,24 @@ def _is_text_only_config(config: dict) -> bool:
     )
 
 
+def _quantization_path_aliases(path: str) -> Tuple[str, ...]:
+    aliases = [path]
+    for prefix in ("language_model.model.", "language_model."):
+        if path.startswith(prefix):
+            aliases.append(path[len(prefix) :])
+    return tuple(dict.fromkeys(aliases))
+
+
+def _quantization_for_module_path(quantization: dict, path: str) -> Optional[dict]:
+    for alias in _quantization_path_aliases(path):
+        value = quantization.get(alias)
+        if isinstance(value, dict):
+            return value
+        if value is False:
+            return {}
+    return None
+
+
 def get_model_path(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -776,6 +794,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         replace_one_bit_modules(quantized_model, quantization, weights)
 
         def get_class_predicate(p, m):
+            per_module_quantization = _quantization_for_module_path(
+                config["quantization"], p
+            )
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
             if (
@@ -785,11 +806,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             ):
                 return False
             # Skip 1-bit layers already replaced above.
-            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
+            module_quantization = (
+                per_module_quantization
+                if per_module_quantization is not None
+                else _quantization_for_path(config["quantization"], p)
+            )
+            if module_quantization.get("bits") == 1:
                 return False
             # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
+            if per_module_quantization is not None:
+                return per_module_quantization
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64

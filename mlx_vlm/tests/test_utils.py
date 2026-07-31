@@ -691,6 +691,73 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
+def test_load_model_matches_prefixed_deepseek_v4_quantization_overrides():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeDeepseekV4Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            self.language_model.model.layers = [nn.Module()]
+            self.language_model.model.layers[0].attn = nn.Module()
+            self.language_model.model.layers[0].attn.wq_a = nn.Linear(
+                4096, 1024, bias=False
+            )
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
+    )
+    quantization = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+        "layers.0.attn.wq_a": {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+    }
+    weights = {
+        "language_model.model.layers.0.attn.wq_a.weight": mx.zeros(
+            (1024, 1024), dtype=mx.uint32
+        ),
+        "language_model.model.layers.0.attn.wq_a.scales": mx.zeros(
+            (1024, 128), dtype=mx.uint8
+        ),
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "deepseek_v4",
+                "quantization": quantization,
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "deepseek_v4"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    predicate = quantize.call_args.kwargs["class_predicate"]
+    spec = predicate(
+        "language_model.model.layers.0.attn.wq_a",
+        FakeDeepseekV4Model(FakeConfig()).language_model.model.layers[0].attn.wq_a,
+    )
+
+    assert spec == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+
+
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
     class FakeConfig:
         @classmethod
