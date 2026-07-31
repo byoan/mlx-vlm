@@ -813,6 +813,18 @@ def _make_cache(
         return [cache.BatchKVCache(left_padding) for _ in model.layers]
 
 
+def _can_use_single_row_prompt_cache(model) -> bool:
+    if not hasattr(model, "make_cache"):
+        return False
+    try:
+        model_cache = model.make_cache()
+    except Exception:
+        return False
+    return not any(
+        isinstance(c, (cache.CacheList, cache.PoolingCache)) for c in model_cache
+    )
+
+
 @dataclass
 class BatchStats:
     """
@@ -1664,6 +1676,7 @@ class PromptProcessingBatch:
             and right_pad_per_row is None
             and kv_bits is None
             and hasattr(model, "make_cache")
+            and _can_use_single_row_prompt_cache(model)
         ):
             self.prompt_cache = cache.make_prompt_cache(model)
         else:
