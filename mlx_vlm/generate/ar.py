@@ -708,6 +708,15 @@ def _merge_prefill_prompt_kwargs(
     return inputs_embeds, merged_kwargs
 
 
+def _is_batch_cache_entry(entry) -> bool:
+    """Return whether a cache entry already owns a batch dimension."""
+    if isinstance(entry, cache.CacheList):
+        return all(_is_batch_cache_entry(child) for child in entry.caches)
+    return callable(getattr(entry, "filter", None)) and callable(
+        getattr(entry, "extend", None)
+    )
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -716,9 +725,9 @@ def _extend_cache(cache_a, cache_b):
         return cache_a
     extended = []
     for ca, cb in zip(cache_a, cache_b):
-        if not hasattr(ca, "left_padding") and hasattr(ca.__class__, "merge"):
+        if not _is_batch_cache_entry(ca) and hasattr(ca.__class__, "merge"):
             ca = ca.__class__.merge([ca])
-        if not hasattr(cb, "left_padding") and hasattr(cb.__class__, "merge"):
+        if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
         ca.extend(cb)
         extended.append(ca)
