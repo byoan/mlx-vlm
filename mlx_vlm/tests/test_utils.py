@@ -708,6 +708,18 @@ def test_load_model_matches_prefixed_deepseek_v4_quantization_overrides():
             self.language_model.model.layers[0].attn.wq_a = nn.Linear(
                 4096, 1024, bias=False
             )
+            self.language_model.model.layers[0].ffn = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts.gate_proj = (
+                nn.Linear(4096, 2048, bias=False)
+            )
+            self.language_model.model.layers[0].ffn.shared_experts.down_proj = (
+                nn.Linear(2048, 4096, bias=False)
+            )
+            self.language_model.model.layers[0].ffn.shared_experts.up_proj = (
+                nn.Linear(4096, 2048, bias=False)
+            )
+            self.language_model.lm_head = nn.Linear(4, 8, bias=False)
 
         def load_weights(self, weights, strict=True):
             self.loaded_weights = weights
@@ -721,6 +733,22 @@ def test_load_model_matches_prefixed_deepseek_v4_quantization_overrides():
         "bits": 4,
         "mode": "mxfp4",
         "layers.0.attn.wq_a": {"group_size": 32, "bits": 8, "mode": "mxfp8"},
+        "layers.0.ffn.shared_experts.w1": {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        },
+        "layers.0.ffn.shared_experts.w2": {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        },
+        "layers.0.ffn.shared_experts.w3": {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        },
+        "head": False,
     }
     weights = {
         "language_model.model.layers.0.attn.wq_a.weight": mx.zeros(
@@ -729,6 +757,25 @@ def test_load_model_matches_prefixed_deepseek_v4_quantization_overrides():
         "language_model.model.layers.0.attn.wq_a.scales": mx.zeros(
             (1024, 128), dtype=mx.uint8
         ),
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj.weight": mx.zeros(
+            (2048, 1024), dtype=mx.uint32
+        ),
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj.scales": mx.zeros(
+            (2048, 128), dtype=mx.uint8
+        ),
+        "language_model.model.layers.0.ffn.shared_experts.down_proj.weight": mx.zeros(
+            (4096, 512), dtype=mx.uint32
+        ),
+        "language_model.model.layers.0.ffn.shared_experts.down_proj.scales": mx.zeros(
+            (4096, 64), dtype=mx.uint8
+        ),
+        "language_model.model.layers.0.ffn.shared_experts.up_proj.weight": mx.zeros(
+            (2048, 1024), dtype=mx.uint32
+        ),
+        "language_model.model.layers.0.ffn.shared_experts.up_proj.scales": mx.zeros(
+            (2048, 128), dtype=mx.uint8
+        ),
+        "language_model.lm_head.weight": mx.zeros((8, 4), dtype=mx.float16),
     }
 
     with (
@@ -750,12 +797,30 @@ def test_load_model_matches_prefixed_deepseek_v4_quantization_overrides():
         load_model(Path("/tmp/model"), lazy=True)
 
     predicate = quantize.call_args.kwargs["class_predicate"]
-    spec = predicate(
+    fake_model = FakeDeepseekV4Model(FakeConfig())
+    attn_spec = predicate(
         "language_model.model.layers.0.attn.wq_a",
-        FakeDeepseekV4Model(FakeConfig()).language_model.model.layers[0].attn.wq_a,
+        fake_model.language_model.model.layers[0].attn.wq_a,
     )
+    shared_expert_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
+    )
+    shared_expert_down_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.down_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.down_proj,
+    )
+    shared_expert_up_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.up_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.up_proj,
+    )
+    head_spec = predicate("language_model.lm_head", fake_model.language_model.lm_head)
 
-    assert spec == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert attn_spec == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert shared_expert_spec == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert shared_expert_down_spec == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert shared_expert_up_spec == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert head_spec == {}
 
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():

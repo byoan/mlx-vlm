@@ -571,6 +571,23 @@ def _quantization_path_aliases(path: str) -> Tuple[str, ...]:
     for prefix in ("language_model.model.", "language_model."):
         if path.startswith(prefix):
             aliases.append(path[len(prefix) :])
+    for alias in tuple(aliases):
+        aliases.append(alias.replace("model.embed_tokens", "embed"))
+        aliases.append(alias.replace("model.norm", "norm"))
+        aliases.append(alias.replace("lm_head", "head"))
+        aliases.append(alias.replace(".ffn.gate.e_score_correction_bias", ".ffn.gate"))
+    for alias in tuple(aliases):
+        for module_name, checkpoint_name in (
+            ("gate_proj", "w1"),
+            ("down_proj", "w2"),
+            ("up_proj", "w3"),
+        ):
+            aliases.append(
+                alias.replace(
+                    f".ffn.shared_experts.{module_name}.",
+                    f".ffn.shared_experts.{checkpoint_name}.",
+                )
+            )
     return tuple(dict.fromkeys(aliases))
 
 
