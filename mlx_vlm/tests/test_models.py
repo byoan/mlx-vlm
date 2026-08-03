@@ -849,6 +849,38 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
         self.assertEqual(converted[skey].shape, (128, 4))
 
+    def test_deepseek_v4_sparse_attention_native_hook(self):
+        from mlx_vlm.models.deepseek_v4 import language
+
+        sentinel = mx.ones((1, 2, 3, 4))
+        calls = []
+
+        def native(*args):
+            calls.append(args)
+            return sentinel
+
+        language.register_native_sparse_pooled_attention(native)
+        try:
+            actual = language._sparse_pooled_attention(
+                mx.zeros((1, 2, 3, 4)),
+                mx.zeros((1, 1, 3, 4)),
+                mx.zeros((1, 5, 4)),
+                mx.zeros((1, 3, 2), dtype=mx.uint32),
+                None,
+                None,
+                0.5,
+                mx.zeros((2,)),
+                q_offset=7,
+                compress_ratio=4,
+                local_window=128,
+            )
+        finally:
+            language.register_native_sparse_pooled_attention(None)
+
+        self.assertIs(actual, sentinel)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-3:], (7, 4, 128))
+
     def test_glm_moe_dsa_language_model(self):
         from mlx_vlm.models import glm_moe_dsa
 

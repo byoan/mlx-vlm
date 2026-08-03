@@ -22,6 +22,16 @@ from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 
 
+_NATIVE_SPARSE_POOLED_ATTENTION = None
+
+
+def register_native_sparse_pooled_attention(callback) -> None:
+    """Register an optional, fail-open DeepSeek sparse-attention backend."""
+
+    global _NATIVE_SPARSE_POOLED_ATTENTION
+    _NATIVE_SPARSE_POOLED_ATTENTION = callback
+
+
 def make_quantization_config(model):
     mxfp4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
     mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
@@ -316,7 +326,31 @@ def _sparse_pooled_attention(
     pooled_mask: Optional[mx.array],
     scale: float,
     sinks: Optional[mx.array],
+    q_offset: Optional[Union[int, mx.array]] = None,
+    compress_ratio: Optional[int] = None,
+    local_window: Optional[int] = None,
 ) -> mx.array:
+    native = _NATIVE_SPARSE_POOLED_ATTENTION
+    if native is not None:
+        try:
+            out = native(
+                q,
+                local_kv,
+                pooled,
+                topk,
+                scale,
+                sinks,
+                q_offset,
+                compress_ratio,
+                local_window,
+            )
+            if out is not None:
+                return out
+        except (RuntimeError, ValueError):
+            # Optional native kernels are shape- and hardware-specific. Keep
+            # the portable MLX implementation as the authoritative fallback.
+            pass
+
     B, H, L, D = q.shape
     idx = topk[:, None, :, :, None]
     pooled = mx.take_along_axis(
@@ -964,6 +998,9 @@ class SparseCompressedAttention(nn.Module):
                 sparse_mask,
                 self.scale,
                 sinks,
+                q_offset=offset,
+                compress_ratio=self.compress_ratio,
+                local_window=self.config.sliding_window,
             )
 
         out = self.rope(out, offset, inverse=True)
