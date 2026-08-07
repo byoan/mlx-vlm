@@ -31,8 +31,11 @@ from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchPoolingCache,
     BatchRotatingKVCache,
+    BufferedRotatingKVCache,
     CacheList,
     KVCache,
+    PoolingCache,
+    RotatingKVCache,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
@@ -2482,6 +2485,87 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+class TestPrefixCacheReuseTrim:
+    @staticmethod
+    def _fill(cache, n, marker=False, heads=1, dim=4):
+        for i in range(n):
+            values = (
+                mx.full((1, heads, 1, dim), float(i))
+                if marker
+                else mx.zeros((1, heads, 1, dim))
+            )
+            cache.update_and_fetch(values, values)
+        return cache
+
+    def test_flat_cache_trims_to_prefix(self):
+        cache = self._fill(KVCache(), 20, marker=True)
+        n_drop = dispatch_module._prefix_cache_trim_amount([cache], 8)
+        assert n_drop == 12
+        cache.trim(n_drop)
+        keys, _ = cache.state
+        assert cache.offset == 8 and keys.shape[2] == 8
+        assert bool(
+            mx.array_equal(keys[0, 0, :, 0], mx.arange(8, dtype=keys.dtype))
+        )
+
+    def test_full_prefix_needs_no_trim(self):
+        cache = self._fill(KVCache(), 12)
+        assert dispatch_module._prefix_cache_trim_amount([cache], 12) == 0
+
+    def test_empty_cache_is_reusable(self):
+        assert dispatch_module._prefix_cache_trim_amount([], 0) == 0
+
+    def test_unwrapped_rotating_trims_and_stays_usable(self):
+        cache = self._fill(RotatingKVCache(max_size=512), 100)
+        n_drop = dispatch_module._prefix_cache_trim_amount([cache], 40)
+        assert n_drop == 60
+        cache.trim(n_drop)
+        assert cache.offset == 40 and cache._idx == 40
+        cache.update_and_fetch(
+            mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4))
+        )
+        assert cache.offset == 41
+
+    def test_wrapped_rotating_is_not_reusable(self):
+        cache = self._fill(RotatingKVCache(max_size=8), 20)
+        assert dispatch_module._prefix_cache_trim_amount([cache], 3) is None
+
+    def test_mixed_flat_and_wrapped_rotating_is_not_reusable(self):
+        flat = self._fill(KVCache(), 20)
+        wrapped = self._fill(RotatingKVCache(max_size=8), 20)
+        assert dispatch_module._prefix_cache_trim_amount([flat, wrapped], 3) is None
+
+    def test_wrapped_buffered_rotating_declines_reuse(self):
+        cache = BufferedRotatingKVCache.from_cache(
+            self._fill(RotatingKVCache(max_size=8), 20), buffer_size=16
+        )
+        assert dispatch_module._prefix_cache_trim_amount([cache], 2) is None
+        cache.update_and_fetch(
+            mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4))
+        )
+
+    def test_unwrapped_buffered_rotating_trims(self):
+        cache = BufferedRotatingKVCache(max_size=512, buffer_size=16)
+        self._fill(cache, 100)
+        assert dispatch_module._prefix_cache_trim_amount([cache], 40) == 60
+        cache.trim(60)
+        assert cache.offset == 40
+        cache.update_and_fetch(
+            mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4))
+        )
+        assert cache.offset == 41
+
+    def test_deepseek_pooling_cache_declines_destructive_rollback(self):
+        flat = self._fill(KVCache(), 20)
+        rotating = BufferedRotatingKVCache(max_size=512, buffer_size=16)
+        self._fill(rotating, 20)
+        pooling = PoolingCache(ratio=4)
+        pooling.update_and_fetch(mx.zeros((1, 1, 4)))
+        compressed = CacheList(rotating, pooling)
+
+        assert dispatch_module._prefix_cache_trim_amount([flat, compressed], 8) is None
 
 
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():

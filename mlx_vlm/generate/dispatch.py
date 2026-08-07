@@ -694,6 +694,46 @@ def _prime_cached_prefix_rope_state(
     return True
 
 
+def _cache_fully_retained(c: Any) -> bool:
+    """Return whether a cache still holds its full sequence from position zero."""
+    children = getattr(c, "caches", None)
+    if children is not None:
+        return all(_cache_fully_retained(child) for child in children)
+    start_position = getattr(c, "start_position", None)
+    if start_position is not None:
+        return int(start_position) == 0
+    max_size = getattr(c, "max_size", None)
+    if max_size is not None:
+        return int(getattr(c, "offset", 0) or 0) <= int(max_size)
+    return True
+
+
+def _cache_can_trim(c: Any) -> bool:
+    """Return whether a cache can discard an arbitrary trailing token count."""
+    children = getattr(c, "caches", None)
+    if children is not None:
+        return all(_cache_can_trim(child) for child in children)
+    is_trimmable = getattr(c, "is_trimmable", None)
+    return bool(is_trimmable()) if callable(is_trimmable) else False
+
+
+def _prefix_cache_trim_amount(
+    kv_cache: List[Any], prefix_len: int
+) -> Optional[int]:
+    """Return the trailing cache tokens to trim, or None when reuse is unsafe."""
+    cached_len = max(
+        (int(getattr(c, "offset", 0) or 0) for c in kv_cache),
+        default=0,
+    )
+    n_drop = max(0, cached_len - prefix_len)
+    if n_drop:
+        if not all(_cache_fully_retained(c) for c in kv_cache):
+            return None
+        if not all(_cache_can_trim(c) for c in kv_cache):
+            return None
+    return n_drop
+
+
 from .ar import generate_step
 
 
@@ -875,27 +915,22 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
-                model, input_ids, mask, kwargs
-            ):
-                reused_prefix_len = prefix_len
-                # Trim to only new tokens
-                input_ids = input_ids[:, prefix_len:]
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-                # Reuse the saved KV cache (trimmed to prefix length)
-                kv_cache = prompt_cache_state.cache
-                # Trim cache to prefix_len in case it includes generated tokens
-                for c in kv_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2]
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[:, :, :prefix_len, :]
-                            c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
-                kwargs["prompt_cache"] = kv_cache
+        kv_cache = prompt_cache_state.cache
+        n_drop = _prefix_cache_trim_amount(kv_cache, prefix_len)
+        if (
+            0 < prefix_len < input_ids.shape[1]
+            and n_drop is not None
+            and _apc_suffix_is_text_only(prefix_len)
+            and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+        ):
+            for c in kv_cache:
+                if n_drop:
+                    c.trim(n_drop)
+            reused_prefix_len = prefix_len
+            input_ids = input_ids[:, prefix_len:]
+            pixel_values = None
+            kwargs.pop("cached_image_features", None)
+            kwargs["prompt_cache"] = kv_cache
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
