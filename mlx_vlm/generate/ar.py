@@ -182,6 +182,7 @@ def generate_step(
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
     seed: Optional[int] = None,
     verbose: bool = False,
     **kwargs,
@@ -378,6 +379,8 @@ def generate_step(
             return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
 
     with mx.stream(generation_stream):
+        if callable(is_cancelled) and is_cancelled():
+            return
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -425,6 +428,8 @@ def generate_step(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
             ) as pbar:
                 while inputs_embeds.shape[1] > 1:
+                    if callable(is_cancelled) and is_cancelled():
+                        return
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     if (
                         checkpoint_len is not None
@@ -457,6 +462,8 @@ def generate_step(
 
             input_ids = input_ids[:, -1:]
 
+        if callable(is_cancelled) and is_cancelled():
+            return
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
     mx.async_eval(y, logprobs)
@@ -481,6 +488,8 @@ def generate_step(
 
     n = 0
     while True:
+        if callable(is_cancelled) and is_cancelled():
+            return
         if n != max_tokens:
             next_y, next_logprobs = _step(y[None])
             mx.async_eval(next_y, next_logprobs)
@@ -583,6 +592,21 @@ def _prompt_kwarg_row(key: str, v: mx.array, row_idx: int, batch_size: int) -> m
     if v.shape[0] == batch_size:
         return v[row_idx : row_idx + 1]
     return v[:1]
+
+
+def _filter_prompt_kwarg_rows(
+    key: str,
+    v: mx.array,
+    keep: mx.array,
+    batch_size: int,
+) -> mx.array:
+    """Filter a prompt kwarg only when it carries this batch's row axis."""
+
+    if _prompt_kwarg_batch_size(key, v) != batch_size:
+        return v
+    if _is_mrope_position_ids_prompt_kwarg(key, v):
+        return v[:, keep, :]
+    return v[keep]
 
 
 def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[dict]:
@@ -1782,6 +1806,91 @@ class PromptProcessingBatch:
     def __len__(self):
         return len(self.uids)
 
+    def filter(self, keep: List[int]) -> None:
+        """Keep selected prompt rows at a chunk boundary."""
+
+        batch_size = len(self.uids)
+        if len(keep) == batch_size:
+            return
+
+        keep_set = set(keep)
+        removed_meta = [
+            meta
+            for idx, meta in enumerate(self._apc_meta)
+            if idx not in keep_set and meta is not None
+        ]
+        if self._apc_manager is not None:
+            for meta in removed_meta:
+                self._apc_manager.release(meta.get("apc_blocks", []))
+
+        if not keep:
+            self.uids = []
+            self._prompt_uids = []
+            self.max_tokens = []
+            self.prompt_cache = []
+            self.logits_processors = []
+            self.thinking_budget_criteria = []
+            self.samplers = [] if self.samplers is not None else None
+            self.greedy_sampling_rows = (
+                [] if self.greedy_sampling_rows is not None else None
+            )
+            self._token_context = []
+            self._apc_meta = []
+            self._prompt_tokens_per_row = []
+            self._cached_tokens_per_row = []
+            self._total_prompt_tokens = 0
+            return
+
+        keep_arr = mx.array(keep, dtype=mx.int32)
+        self.uids = [self.uids[idx] for idx in keep]
+        self._prompt_uids = [self._prompt_uids[idx] for idx in keep]
+        self.max_tokens = [self.max_tokens[idx] for idx in keep]
+        self._left_padding_per_row = [
+            self._left_padding_per_row[idx] for idx in keep
+        ]
+        if self._right_pad_per_row is not None:
+            self._right_pad_per_row = [
+                self._right_pad_per_row[idx] for idx in keep
+            ]
+        self._suffix_lens = [self._suffix_lens[idx] for idx in keep]
+        self._prompt_tokens_per_row = [
+            self._prompt_tokens_per_row[idx] for idx in keep
+        ]
+        self._cached_tokens_per_row = [
+            self._cached_tokens_per_row[idx] for idx in keep
+        ]
+        self._total_prompt_tokens = sum(self._prompt_tokens_per_row)
+        if len(self._apc_meta) == batch_size:
+            self._apc_meta = [self._apc_meta[idx] for idx in keep]
+        if self.logits_processors:
+            self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        if self.thinking_budget_criteria:
+            self.thinking_budget_criteria = [
+                self.thinking_budget_criteria[idx] for idx in keep
+            ]
+        if self.samplers is not None:
+            self.samplers = [self.samplers[idx] for idx in keep]
+        if self.greedy_sampling_rows is not None:
+            self.greedy_sampling_rows = [
+                self.greedy_sampling_rows[idx] for idx in keep
+            ]
+        if self._token_context:
+            self._token_context = [self._token_context[idx] for idx in keep]
+
+        self._input_ids = self._input_ids[keep_arr]
+        if self._inputs_embeds is not None:
+            self._inputs_embeds = self._inputs_embeds[keep_arr]
+        self._prompt_kwargs = {
+            key: (
+                _filter_prompt_kwarg_rows(key, value, keep_arr, batch_size)
+                if isinstance(value, mx.array)
+                else value
+            )
+            for key, value in self._prompt_kwargs.items()
+        }
+        for prompt_cache in self.prompt_cache:
+            prompt_cache.filter(keep_arr)
+
     def _release_apc_meta_blocks(self):
         if self._apc_manager is None:
             return
@@ -2646,12 +2755,15 @@ class BatchGenerator:
 
             # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
-                if len(self._prompt_batch.uids) == 1:
-                    self._prompt_batch.uids = []
-                    self._prompt_batch.prompt_cache = []
+                idx = self._prompt_batch.uids.index(uid)
+                keep = [
+                    i for i in range(len(self._prompt_batch.uids)) if i != idx
+                ]
+                self._prompt_batch.filter(keep)
+                if not keep:
                     self._prompt_batch = None
-                    mx.clear_cache()
-                    return True
+                mx.clear_cache()
+                return True
 
             # Already decoding.
             if uid in self._generation_batch.uids:

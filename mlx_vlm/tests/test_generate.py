@@ -1137,6 +1137,49 @@ class TestBatchGenerator:
         assert uids[0] in remaining_uids
         assert uids[2] in remaining_uids
 
+    def test_remove_one_row_from_active_prefill_batch(
+        self,
+        mock_model,
+        mock_processor,
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+            prefill_batch_size=2,
+            prefill_step_size=2,
+        )
+        uids = gen.insert(
+            [
+                list(range(1, 10)),
+                list(range(11, 20)),
+            ],
+            prompt_kwargs=[
+                {"inputs_embeds": mx.zeros((1, 9, 768))},
+                {"inputs_embeds": mx.zeros((1, 9, 768))},
+            ],
+        )
+
+        gen._unprocessed_sequences = []
+        gen._prompt_batch = PromptProcessingBatch(
+            model=mock_model.language_model,
+            uids=uids,
+            input_ids=[list(range(1, 10)), list(range(11, 20))],
+            max_tokens=[50, 50],
+            inputs_embeds=mx.zeros((2, 9, 768)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[BatchKVCache([0, 0])],
+        )
+
+        assert gen._prompt_batch is not None
+        assert gen._prompt_batch.uids == uids
+        assert gen.remove(uids[0]) is True
+        assert gen._prompt_batch is not None
+        assert gen._prompt_batch.uids == [uids[1]]
+        assert gen._prompt_batch._input_ids.shape[0] == 1
+        assert gen._prompt_batch._inputs_embeds.shape[0] == 1
+
     def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
@@ -1845,6 +1888,21 @@ class TestSamplerArgs:
         mock_make_logits_processors.assert_called_once_with(
             {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
         )
+
+
+def test_generate_step_stops_before_prefill_when_cancelled():
+    model = MagicMock()
+    gen = generate_module.generate_step(
+        input_ids=mx.array([[1, 2, 3]], dtype=mx.int32),
+        model=model,
+        pixel_values=None,
+        mask=None,
+        max_tokens=1,
+        is_cancelled=lambda: True,
+    )
+
+    assert list(gen) == []
+    model.get_input_embeddings.assert_not_called()
 
 
 def test_generate_step_schedules_final_prefill_async():

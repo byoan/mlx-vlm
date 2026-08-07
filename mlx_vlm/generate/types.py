@@ -54,6 +54,7 @@ class GenerateKwargs(TypedDict, total=False):
     prompt_cache_state: Any
     apc_manager: Any
     apc_tenant: str | None
+    is_cancelled: Callable[[], bool] | None
     seed: int | None
     verbose: bool
     video: str | list[str] | None

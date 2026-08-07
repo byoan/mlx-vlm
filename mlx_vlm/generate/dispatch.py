@@ -727,6 +727,9 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
+    is_cancelled = kwargs.pop("is_cancelled", None)
+    if callable(is_cancelled) and is_cancelled():
+        return
     # Preserve only explicitly supplied sequence tensors as semantic APC
     # inputs. Tensors produced by prepare_inputs span the complete prompt and
     # therefore change whenever text is appended, even when the old token
@@ -782,6 +785,8 @@ def stream_generate(
             add_special_tokens=add_special_tokens,
             **kwargs,
         )
+        if callable(is_cancelled) and is_cancelled():
+            return
         input_ids = inputs.get("input_ids", None)
         pixel_values = inputs.get("pixel_values", None)
         mask = inputs.get("attention_mask", None)
@@ -993,6 +998,7 @@ def stream_generate(
             mask,
             prompt_cache_checkpoint=exact_checkpoint,
             prompt_cache_checkpoint_len=exact_checkpoint_len,
+            is_cancelled=is_cancelled,
             verbose=verbose,
             **kwargs,
         )
