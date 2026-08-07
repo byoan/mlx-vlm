@@ -2123,6 +2123,67 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_stream_generate_reports_request_speculative_stats_on_terminal_chunk():
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        def reset(self):
+            self.segments = []
+
+        def add_token(self, token, skip_special_token_ids=None):
+            self.segments.append(str(token))
+
+        @property
+        def last_segment(self):
+            return self.segments.pop(0) if self.segments else ""
+
+        def finalize(self):
+            pass
+
+    drafter = SimpleNamespace(
+        speculative_total_rounds=10,
+        speculative_total_accepted=20.0,
+        speculative_total_drafted=30,
+    )
+
+    def fake_generate_step(*args, **kwargs):
+        drafter.speculative_total_rounds += 2
+        drafter.speculative_total_accepted += 5
+        drafter.speculative_total_drafted += 8
+        yield 7, mx.zeros((4,))
+
+    tokenizer = SimpleNamespace(stopping_criteria=FakeStoppingCriteria())
+    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+
+    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
+        chunks = list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                max_tokens=1,
+                draft_model=drafter,
+                draft_kind="mtp",
+            )
+        )
+
+    terminal = chunks[-1]
+    assert terminal.draft_kind == "mtp"
+    assert terminal.draft_rounds == 2
+    assert terminal.draft_n == 8
+    assert terminal.draft_n_accepted == 5
+
+
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
     captured = {}
     tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
