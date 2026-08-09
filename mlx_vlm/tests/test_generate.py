@@ -665,6 +665,18 @@ class TestBatchGenerator:
         assert pooling.remainder == [2, 1]
         assert pooling.pooled.shape[0] == 2
 
+    def test_make_cache_converts_pooling_cache_for_continuous_batching(self):
+        class PoolingModel:
+            def make_cache(self):
+                return [PoolingCache(ratio=4)]
+
+        caches = ar_module._make_cache(PoolingModel(), [0, 0])
+
+        assert len(caches) == 1
+        assert isinstance(caches[0], BatchPoolingCache)
+        assert caches[0].ratio == 4
+        assert caches[0].remainder == [0, 0]
+
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
     ):
