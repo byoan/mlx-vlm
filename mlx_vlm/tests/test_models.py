@@ -853,6 +853,7 @@ class TestModels(unittest.TestCase):
         from mlx_vlm.models.deepseek_v4 import language
 
         sentinel = mx.ones((1, 2, 3, 4))
+        inverse_rope_freqs = mx.ones((2,), dtype=mx.float32)
         calls = []
 
         def native(*args):
@@ -873,13 +874,15 @@ class TestModels(unittest.TestCase):
                 q_offset=7,
                 compress_ratio=4,
                 local_window=128,
+                inverse_rope_freqs=inverse_rope_freqs,
             )
         finally:
             language.register_native_sparse_pooled_attention(None)
 
         self.assertIs(actual, sentinel)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][-3:], (7, 4, 128))
+        self.assertEqual(calls[0][-4:-1], (7, 4, 128))
+        self.assertIs(calls[0][-1], inverse_rope_freqs)
 
     def test_glm_moe_dsa_language_model(self):
         from mlx_vlm.models import glm_moe_dsa

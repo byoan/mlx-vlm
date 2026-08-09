@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from functools import partial
 from threading import local
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -23,6 +24,12 @@ from .hyper_connection import HyperConnection, HyperHead, hc_expand
 
 
 _NATIVE_SPARSE_POOLED_ATTENTION = None
+
+
+@dataclass
+class _SparsePooledAttentionResult:
+    output: mx.array
+    inverse_rope_applied: bool = False
 
 
 def register_native_sparse_pooled_attention(callback) -> None:
@@ -329,6 +336,7 @@ def _sparse_pooled_attention(
     q_offset: Optional[Union[int, mx.array]] = None,
     compress_ratio: Optional[int] = None,
     local_window: Optional[int] = None,
+    inverse_rope_freqs: Optional[mx.array] = None,
 ) -> mx.array:
     native = _NATIVE_SPARSE_POOLED_ATTENTION
     if native is not None:
@@ -343,6 +351,7 @@ def _sparse_pooled_attention(
                 q_offset,
                 compress_ratio,
                 local_window,
+                inverse_rope_freqs,
             )
             if out is not None:
                 return out
@@ -1001,9 +1010,17 @@ class SparseCompressedAttention(nn.Module):
                 q_offset=offset,
                 compress_ratio=self.compress_ratio,
                 local_window=self.config.sliding_window,
+                inverse_rope_freqs=self.rope._get_freqs(
+                    self.head_dim, inverse=True
+                ),
             )
 
-        out = self.rope(out, offset, inverse=True)
+        inverse_rope_applied = False
+        if isinstance(out, _SparsePooledAttentionResult):
+            inverse_rope_applied = out.inverse_rope_applied
+            out = out.output
+        if not inverse_rope_applied:
+            out = self.rope(out, offset, inverse=True)
 
         out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
         out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
