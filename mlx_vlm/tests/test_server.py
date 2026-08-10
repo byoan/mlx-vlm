@@ -30,6 +30,25 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
+def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
+    class DormantThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setenv("PREFILL_STEP_SIZE", "2048")
+    monkeypatch.setattr(server_generation, "Thread", DormantThread)
+
+    generator = server.ResponseGenerator(
+        model_path="/models/deepseek",
+        prefill_step_size=3072,
+    )
+
+    assert generator.prefill_step_size == 3072
+
+
 @pytest.fixture
 def client():
     with TestClient(server.app) as test_client:
