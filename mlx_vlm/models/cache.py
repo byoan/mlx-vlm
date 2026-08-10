@@ -1369,6 +1369,8 @@ class BatchRotatingKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._lengths is not None:
+            self._lengths = self._lengths[batch_indices]
 
     def extend(self, other):
         """

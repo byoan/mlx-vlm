@@ -533,6 +533,24 @@ class TestBatchRotatingRightPadPrefill:
         k2, v2 = _rand_kv(batch=2, seq_len=1)
         cache.update_and_fetch(k2, v2)
 
+    def test_filter_keeps_pending_lengths_aligned_with_cache_rows(self):
+        cache = BatchRotatingKVCache(32, [0, 0])
+        cache.prepare(right_padding=[1, 0], lengths=[5, 6])
+
+        k1, v1 = _rand_kv(batch=2, seq_len=3)
+        cache.update_and_fetch(k1, v1)
+        cache.filter(mx.array([1], dtype=mx.int32))
+
+        assert cache.keys.shape[0] == 1
+        assert cache._lengths.shape == (1,)
+
+        k2, v2 = _rand_kv(batch=1, seq_len=2)
+        out_k, out_v = cache.update_and_fetch(k2, v2)
+        mx.eval(out_k, out_v)
+
+        assert out_k.shape[0] == 1
+        assert out_v.shape[0] == 1
+
 
 class TestBatchTurboQuantParity:
     def test_batch_size_and_is_single_row(self):
