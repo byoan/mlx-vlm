@@ -812,6 +812,25 @@ class TestModels(unittest.TestCase):
 
         model = deepseek_v4.Model(config)
 
+        self.assertTrue(model.language_model.chunked_prefill_policy())
+        self.assertFalse(
+            model.language_model.chunked_prefill_policy(
+                draft_model=object(),
+                draft_kind="mtp",
+                prefill_kwargs={},
+            )
+        )
+        self.assertTrue(
+            model.language_model.chunked_prefill_policy(
+                draft_model=object(),
+                draft_kind="mtp",
+                prefill_kwargs={
+                    "return_hidden": True,
+                    "return_shared_kv": True,
+                },
+            )
+        )
+
         self.language_test_runner(
             model.language_model,
             config.model_type,

@@ -1337,6 +1337,30 @@ class LanguageModel(nn.Module):
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        """Allow chunked prefill when speculative state is captured at the tail."""
+
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_model is None:
+            return True
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
+                prefill_kwargs.get("return_shared_kv", False)
+            )
+        if draft_kind in ("dflash", "eagle3"):
+            return prefill_kwargs.get("capture_layer_ids") is not None
+        return draft_kind is None
+
     def __call__(
         self,
         inputs: Optional[mx.array] = None,
