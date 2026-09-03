@@ -70,6 +70,8 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         self._draft_lm_head_quantization = None
         self._draft_vocab_ids = None
         object.__setattr__(self, "_draft_vocab_ids_array", None)
+        self._compile_input_fusion = True
+        object.__setattr__(self, "_compiled_input_fusion", None)
         self._cache: List[QSAKVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -118,6 +120,7 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         super().bind(target_model)
         quantization = self._draft_lm_head_quantization
         if quantization is None:
+            self._install_compiled_input_fusion()
             return self
 
         target_head = self._lm_head_fn
@@ -150,7 +153,35 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
             mx.eval(self._draft_lm_head.parameters())
             self._draft_lm_head_key = key
         self._lm_head_fn = self._draft_lm_head
+        self._install_compiled_input_fusion()
         return self
+
+    def configure_compiled_input_fusion(self, enabled: bool = True) -> None:
+        """Select compiled batch-one, single-token input fusion."""
+        self._compile_input_fusion = bool(enabled)
+        if not enabled:
+            object.__setattr__(self, "_compiled_input_fusion", None)
+
+    def _install_compiled_input_fusion(self) -> None:
+        if not self._compile_input_fusion or self._compiled_input_fusion is not None:
+            return
+        width = self.args.hc_count * self.args.hidden_size
+        dtype = self.pre_fc_norm_hidden.weight.dtype
+        if dtype not in (mx.bfloat16, mx.float16):
+            return
+        hidden = mx.arange(width, dtype=mx.float32).reshape(1, 1, width).astype(dtype)
+        token_embed = (
+            mx.arange(self.args.hidden_size, dtype=mx.float32)
+            .reshape(1, 1, self.args.hidden_size)
+            .astype(dtype)
+        )
+        expected = self._fuse_inputs_eager(token_embed, hidden)
+        compiled = mx.compile(self._fuse_inputs_eager)
+        actual = compiled(token_embed, hidden)
+        mx.eval(expected, actual)
+        if not mx.array_equal(actual, expected).item():
+            raise RuntimeError("compiled Qwen4 MTP input fusion failed exact parity")
+        object.__setattr__(self, "_compiled_input_fusion", compiled)
 
     def _sample_hidden(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
         token = None
@@ -198,7 +229,7 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
             )
         return hidden
 
-    def fuse_inputs(
+    def _fuse_inputs_eager(
         self,
         token_embed: mx.array,
         hidden: mx.array,
@@ -212,6 +243,20 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         return (projected_embedding[..., None, :] + projected_hidden).reshape(
             hidden.shape
         )
+
+    def fuse_inputs(
+        self,
+        token_embed: mx.array,
+        hidden: mx.array,
+    ) -> mx.array:
+        hidden = self._target_hidden(hidden)
+        if (
+            self._compiled_input_fusion is not None
+            and hidden.shape[:2] == (1, 1)
+            and token_embed.shape[:2] == (1, 1)
+        ):
+            return self._compiled_input_fusion(token_embed, hidden)
+        return self._fuse_inputs_eager(token_embed, hidden)
 
     def _forward_hidden(
         self,

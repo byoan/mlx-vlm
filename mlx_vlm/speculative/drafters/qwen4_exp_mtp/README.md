@@ -77,5 +77,9 @@ proposals. Restricting the draft vocabulary can change proposal tokens and
 acceptance, especially with sampling; benchmark the intended temperature and
 prompt distribution.
 
+The batch-one, single-token input-fusion graph used by chained proposals is
+compiled automatically after binding the drafter. Prompt/history fusion and
+other shapes remain on the eager path.
+
 A locally converted target model can be supplied to `--model` in the
 generation command as well.
