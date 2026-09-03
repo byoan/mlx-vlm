@@ -64,6 +64,9 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
 
         self._input_embed = None
         self._lm_head_fn = None
+        self._draft_lm_head = None
+        self._draft_lm_head_key = None
+        self._draft_lm_head_quantization = None
         self._cache: List[QSAKVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -75,6 +78,47 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
 
         self.accept_lens: List[int] = []
         self.draft_lens: List[int] = []
+
+    def configure_draft_lm_head(
+        self,
+        bits: int,
+        group_size: int = 32,
+        mode: str = "affine",
+    ) -> None:
+        """Use a private quantized copy of the target head for drafting."""
+        if bits not in range(2, 9):
+            raise ValueError("draft LM-head bits must be between 2 and 8")
+        if group_size <= 0 or self.args.hidden_size % group_size:
+            raise ValueError(
+                "draft LM-head group size must divide the model hidden size"
+            )
+        self._draft_lm_head_quantization = (group_size, bits, mode)
+        self._draft_lm_head = None
+        self._draft_lm_head_key = None
+
+    def bind(self, target_model) -> "Qwen4ExpMTPDraftModel":
+        super().bind(target_model)
+        quantization = self._draft_lm_head_quantization
+        if quantization is None:
+            return self
+
+        target_head = self._lm_head_fn
+        if not isinstance(target_head, nn.Linear):
+            raise ValueError(
+                "Qwen4 draft LM-head quantization requires a dense target LM head"
+            )
+        group_size, bits, mode = quantization
+        key = (id(target_head.weight), group_size, bits, mode)
+        if self._draft_lm_head is None or self._draft_lm_head_key != key:
+            self._draft_lm_head = target_head.to_quantized(
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            mx.eval(self._draft_lm_head.parameters())
+            self._draft_lm_head_key = key
+        self._lm_head_fn = self._draft_lm_head
+        return self
 
     @property
     def quant_predicate(self):
