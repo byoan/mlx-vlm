@@ -106,6 +106,55 @@ def test_qwen4_mtp_fusion_matches_released_equations():
     assert mx.allclose(actual, expected, atol=2e-5).item()
 
 
+def test_qwen4_mtp_compiles_single_token_input_fusion_after_bind():
+    config = _tiny_text_config()
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
+    drafter.set_dtype(mx.bfloat16)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            args=config,
+            model=SimpleNamespace(embed_tokens=nn.Embedding(64, 32)),
+            lm_head=nn.Linear(32, 64, bias=False),
+        )
+    )
+    embedding = mx.random.normal((1, 1, 32)).astype(mx.bfloat16)
+    hidden = mx.random.normal((1, 1, 64)).astype(mx.bfloat16)
+    expected = drafter._fuse_inputs_eager(embedding, hidden)
+
+    drafter.bind(target)
+    actual = drafter.fuse_inputs(embedding, hidden)
+    mx.eval(expected, actual)
+
+    assert drafter._compiled_input_fusion is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_qwen4_mtp_keeps_multi_token_input_fusion_eager():
+    config = _tiny_text_config()
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
+    drafter.set_dtype(mx.bfloat16)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            args=config,
+            model=SimpleNamespace(embed_tokens=nn.Embedding(64, 32)),
+            lm_head=nn.Linear(32, 64, bias=False),
+        )
+    )
+    embedding = mx.random.normal((1, 3, 32)).astype(mx.bfloat16)
+    hidden = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    drafter.bind(target)
+
+    with patch.object(
+        drafter, "_fuse_inputs_eager", wraps=drafter._fuse_inputs_eager
+    ) as eager:
+        actual = drafter.fuse_inputs(embedding, hidden)
+    expected = drafter._fuse_inputs_eager(embedding, hidden)
+    mx.eval(expected, actual)
+
+    eager.assert_called_once()
+    assert mx.array_equal(actual, expected).item()
+
+
 def test_qwen4_mtp_uses_requested_block_size_as_adaptive_ceiling():
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
 
