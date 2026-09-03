@@ -139,6 +139,12 @@ def test_qwen4_mtp_can_use_private_quantized_draft_head():
     assert drafter._lm_head_fn is first_draft_head
     assert target.language_model.lm_head is target_head
 
+    hidden = mx.random.normal((1, 1, 32)).astype(mx.bfloat16)
+    expected = mx.argmax(first_draft_head(hidden), axis=-1)
+    actual = drafter._sample_hidden(hidden, None, greedy=True)
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+
     drafter.bind(target)
     assert drafter._draft_lm_head is first_draft_head
 
