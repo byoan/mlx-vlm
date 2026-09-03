@@ -231,8 +231,20 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
             gate, up = mx.split(gate_up, 2, axis=-2)
             stripped["layers.0.mlp.switch_mlp.gate_proj.weight"] = gate
             stripped["layers.0.mlp.switch_mlp.up_proj.weight"] = up
+            gate_up_scales_key = f"{gate_up_key}_scales"
+            if gate_up_scales_key in stripped:
+                gate_scales, up_scales = mx.split(
+                    stripped.pop(gate_up_scales_key), 2, axis=-2
+                )
+                stripped["layers.0.mlp.switch_mlp.gate_proj.scales"] = gate_scales
+                stripped["layers.0.mlp.switch_mlp.up_proj.scales"] = up_scales
         if down_key in stripped:
             stripped["layers.0.mlp.switch_mlp.down_proj.weight"] = stripped.pop(
                 down_key
             )
+            down_scales_key = f"{down_key}_scales"
+            if down_scales_key in stripped:
+                stripped["layers.0.mlp.switch_mlp.down_proj.scales"] = stripped.pop(
+                    down_scales_key
+                )
         return stripped

@@ -618,9 +618,26 @@ def test_qwen4_mtp_splitter_converts_official_fp8_experts(tmp_path):
     gate = split_weights["layers.0.mlp.switch_mlp.gate_proj.weight"]
     up = split_weights["layers.0.mlp.switch_mlp.up_proj.weight"]
     down = split_weights["layers.0.mlp.switch_mlp.down_proj.weight"]
-    mx.eval(gate, up, down)
-    assert gate.shape == (2, 128, 128)
-    assert up.shape == (2, 128, 128)
-    assert down.shape == (2, 128, 128)
+    gate_scales = split_weights["layers.0.mlp.switch_mlp.gate_proj.scales"]
+    up_scales = split_weights["layers.0.mlp.switch_mlp.up_proj.scales"]
+    down_scales = split_weights["layers.0.mlp.switch_mlp.down_proj.scales"]
+    mx.eval(gate, up, down, gate_scales, up_scales, down_scales)
+    assert gate.shape == (2, 128, 32)
+    assert up.shape == (2, 128, 32)
+    assert down.shape == (2, 128, 32)
+    assert gate.dtype == mx.uint32
+    assert up.dtype == mx.uint32
+    assert down.dtype == mx.uint32
+    for weight, scales in (
+        (gate, gate_scales),
+        (up, up_scales),
+        (down, down_scales),
+    ):
+        restored = mx.dequantize(weight, scales, group_size=32, bits=8, mode="mxfp8")
+        assert restored.shape == (2, 128, 128)
     assert not any(key.endswith("weight_scale_inv") for key in split_weights)
-    assert "quantization" not in config
+    assert config["quantization"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+    }
