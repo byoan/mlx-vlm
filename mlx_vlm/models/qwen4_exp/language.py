@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_map
 
 from ..base import LanguageModelOutput
 from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
@@ -18,6 +19,8 @@ from ..qwen3_5.language import (
     _create_qwen3_5_ssm_mask,
     _extract_row_cache,
     _pad_row_time,
+    _qwen3_5_advance_left_padding_info,
+    _qwen3_5_advance_lengths_info,
     _qwen3_5_left_padding_info,
     _restore_batch_padding_metadata,
 )
@@ -1078,7 +1081,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (position_in_segment >= shift) & (source_positions[None] >= 0)
         return mx.where(valid, shifted, self.eos_token_id)
 
-    def __call__(self, input_ids: mx.array, cache: Optional[ArraysCache]):
+    def __call__(
+        self, input_ids: mx.array, cache: Optional[ArraysCache], *, state_sink=None
+    ):
         input_ids = input_ids.astype(mx.int64)
         batch = input_ids.shape[0]
         if cache is not None and cache[3] is not None:
@@ -1089,6 +1094,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
 
         token_history = mx.concatenate([previous_context, input_ids], axis=-1)
+        if state_sink is not None:
+            state_sink.append(token_history)
         if cache is not None:
             cache[3] = mx.contiguous(token_history[:, -self.context_len :])
 
@@ -1155,7 +1162,9 @@ class Qwen4ExpPLELayer(nn.Module):
             bias=False,
         )
 
-    def _short_conv(self, x: mx.array, cache: Optional[ArraysCache]):
+    def _short_conv(
+        self, x: mx.array, cache: Optional[ArraysCache], *, state_sink=None
+    ):
         batch = x.shape[0]
         if cache is not None and cache[2] is not None:
             state = cache[2]
@@ -1164,6 +1173,8 @@ class Qwen4ExpPLELayer(nn.Module):
                 (batch, self.short_conv_state_len, x.shape[-1]), dtype=x.dtype
             )
         conv_input = mx.concatenate([state, x], axis=1)
+        if state_sink is not None:
+            state_sink.append(conv_input)
         if cache is not None:
             cache[2] = mx.contiguous(conv_input[:, -self.short_conv_state_len :])
         return nn.silu(self.conv1d(conv_input))
@@ -1442,7 +1453,10 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         return hyper_input + injection.reshape(*hyper_input.shape)
 
     def _ple(self, module, hidden_states, input_ids, cache, mask):
-        embeddings = module.ple_embedding(input_ids, cache)
+        # Retain the rolling-window inputs, not another copy of each prefix.
+        # A rejected block can select the accepted n-gram and conv windows.
+        ple_state = []
+        embeddings = module.ple_embedding(input_ids, cache, state_sink=ple_state)
         keys = module.norm_key(self._linear(module.key_proj, embeddings)).reshape(
             *hidden_states.shape[:-1], module.hc_count, module.hidden_size
         )
@@ -1461,7 +1475,8 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             gated_values = mx.where(mask[..., None], gated_values, 0)
             normed = mx.where(mask[..., None], normed, 0)
-        return gated_values + module._short_conv(normed, cache)
+        output = gated_values + module._short_conv(normed, cache, state_sink=ple_state)
+        return output, ple_state
 
     def _qsa_mask(self, attention, hidden_states, cache, position_ids, mask):
         projected = self._linear(attention.indexer.index_qk_proj, hidden_states)
@@ -1487,14 +1502,17 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         position_ids,
         gdn_sink,
     ):
+        ple_state = None
         if "ple" in layer:
-            hidden = hidden + self._ple(layer.ple, hidden, input_ids, cache, mask)
+            ple_output, ple_state = self._ple(layer.ple, hidden, input_ids, cache, mask)
+            hidden = hidden + ple_output
 
         mixed, hyper_input, injection = self._hyper_connection(
             layer.attn_hyper_connection, hidden
         )
         if layer.is_linear:
             branch = self._gated_delta(layer.linear_attn, mixed, mask, cache, gdn_sink)
+            gdn_sink[-1] += (ple_state,)
         else:
             attention_mask = self._qsa_mask(
                 layer.self_attn, mixed, cache, position_ids, mask
@@ -1681,11 +1699,17 @@ class LanguageModel(Qwen3_5LanguageModel):
     def _snapshot_speculative_cache(caches):
         snapshots = []
         for entry in caches:
+            # Batch cache offsets are updated in place during verification.
+            # Snapshot array objects as well as their surrounding containers.
+            state = tree_map(
+                lambda value: mx.array(value) if isinstance(value, mx.array) else value,
+                entry.state,
+            )
             if isinstance(entry, ArraysCache):
                 snapshots.append(
                     (
                         "arrays",
-                        list(entry.state),
+                        list(state),
                         getattr(entry, "_left_padding", None),
                         getattr(entry, "_left_padding_advance", 0),
                         getattr(entry, "_lengths", None),
@@ -1693,7 +1717,6 @@ class LanguageModel(Qwen3_5LanguageModel):
                     )
                 )
             else:
-                state = entry.state
                 if isinstance(state, list):
                     state = list(state)
                 elif isinstance(state, tuple):
@@ -1724,8 +1747,10 @@ class LanguageModel(Qwen3_5LanguageModel):
                 entry.meta_state = meta_state
 
     def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
-        snapshot = self._snapshot_speculative_cache(cache)
         batch, length = inputs.shape
+        # Multi-row verification does not yet have tokenwise-equivalent cache
+        # numerics. Preserve its restore-and-replay fallback until it does.
+        snapshot = self._snapshot_speculative_cache(cache) if batch > 1 else None
         cache_entry = cache[self.model.fa_idx]
         cache_offset = getattr(cache_entry, "offset", 0)
         if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
@@ -1745,7 +1770,9 @@ class LanguageModel(Qwen3_5LanguageModel):
             position_ids=position_ids,
             skip_logits=sampler is None,
         )
-        rollback_state = (snapshot, inputs)
+        rollback_state = (
+            (snapshot, inputs) if snapshot is not None else output.gdn_states
+        )
         hidden = output.hidden_states[-1]
         if sampler is None:
             return hidden, {}, rollback_state
@@ -1764,7 +1791,6 @@ class LanguageModel(Qwen3_5LanguageModel):
         accepted,
         block_size: int,
     ) -> int:
-        del block_size
         if isinstance(accepted, int):
             accepted_list = [accepted]
         elif isinstance(accepted, mx.array):
@@ -1776,15 +1802,55 @@ class LanguageModel(Qwen3_5LanguageModel):
                 "Qwen4-Exp MTP batched rollback requires uniform acceptance."
             )
 
-        snapshots, verify_inputs = rollback_state
-        self._restore_speculative_cache(caches, snapshots)
         keep = accepted_list[0] + 1
-        for index in range(keep):
-            self(
-                verify_inputs[:, index : index + 1],
-                cache=caches,
-                skip_logits=True,
-            )
+        if not 1 <= keep <= block_size:
+            raise ValueError("Qwen4-Exp accepted tokens must fit the verified block.")
+        if isinstance(rollback_state, tuple):
+            snapshots, verify_inputs = rollback_state
+            self._restore_speculative_cache(caches, snapshots)
+            for index in range(keep):
+                self(
+                    verify_inputs[:, index : index + 1],
+                    cache=caches,
+                    skip_logits=True,
+                )
+            return accepted_list[0]
+        trim = block_size - keep
+        if trim == 0:
+            return accepted_list[0]
+
+        states = iter(rollback_state)
+        for layer, cache in zip(self.layers, caches):
+            if not layer.is_linear:
+                cache.trim(trim)
+                continue
+
+            (
+                _q,
+                _k,
+                _v,
+                _a,
+                _b,
+                _A_log,
+                _dt_bias,
+                _initial_state,
+                _mask,
+                conv_input,
+                kernel_size,
+                intermediate_states,
+                ple_state,
+            ) = next(states)
+            # The verifier already records the state after every speculative
+            # position. Keep the accepted prefix without running the model again.
+            cache[0] = mx.contiguous(conv_input[:, keep : keep + kernel_size - 1])
+            cache[1] = mx.contiguous(intermediate_states[:, keep - 1])
+            if ple_state is not None:
+                token_history, ple_conv_input = ple_state
+                cache[2] = mx.contiguous(ple_conv_input[:, keep:-trim])
+                cache[3] = mx.contiguous(token_history[:, keep:-trim])
+            cache.advance(-trim)
+            _qwen3_5_advance_left_padding_info(cache, -trim)
+            _qwen3_5_advance_lengths_info(cache, -trim)
         return accepted_list[0]
 
     def make_cache(self):

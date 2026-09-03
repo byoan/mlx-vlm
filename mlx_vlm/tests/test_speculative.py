@@ -664,11 +664,12 @@ def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
     assert bool(mx.array_equal(ref, out).item())
 
 
-def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv(dtype):
     mx.random.seed(9)
     linear = nn.Linear(256, 512, bias=False)
-    linear.weight = mx.random.normal((512, 256)).astype(mx.bfloat16)
-    x = mx.random.normal((1, 4, 256)).astype(mx.bfloat16)
+    linear.weight = mx.random.normal((512, 256)).astype(dtype)
+    x = mx.random.normal((1, 4, 256)).astype(dtype)
 
     ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
     out = qwen_verifier._target_verify_linear(linear, x)

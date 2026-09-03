@@ -179,7 +179,8 @@ def exact_speculative_verify_weight(weight: mx.array, x: mx.array) -> mx.array |
     batch, length, dimensions = x.shape
     outputs = weight.shape[0]
     if (
-        outputs < 4
+        x.dtype not in (mx.bfloat16, mx.float16)
+        or outputs < 4
         or outputs % 4 != 0
         or dimensions >= 16 * outputs
         or weight.dtype != x.dtype
