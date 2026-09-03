@@ -1041,6 +1041,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "fp8" and config.get("model_type") in {
                 "qwen3_5",
                 "qwen3_5_moe",
+                "qwen4_exp",
             }:
                 from .models.qwen3_5.fp8 import make_quantization_config
 

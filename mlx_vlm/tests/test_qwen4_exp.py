@@ -596,7 +596,7 @@ class Qwen4ExpTests(unittest.TestCase):
                 weights[key] = mx.to_fp8(mx.ones((128, 128)) * (expert + 1))
                 weights[f"{key}_scale_inv"] = mx.ones((1, 1))
         ple = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
-        weights[f"{ple}.shard_0.weight"] = mx.to_fp8(mx.ones((4, 8)))
+        weights[f"{ple}.shard_0.weight"] = mx.to_fp8(mx.ones((4, 32)))
         weights[f"{ple}.weight_scale"] = mx.array([0.5], dtype=mx.bfloat16)
 
         sanitized = model.sanitize(weights)
@@ -607,12 +607,25 @@ class Qwen4ExpTests(unittest.TestCase):
         ple_weight = sanitized[
             f"{mapped}.ple.ple_embedding.ngram_embedding.shards.0.weight"
         ]
+        gate_scales = sanitized[f"{mapped}.mlp.switch_mlp.gate_proj.scales"]
+        up_scales = sanitized[f"{mapped}.mlp.switch_mlp.up_proj.scales"]
+        down_scales = sanitized[f"{mapped}.mlp.switch_mlp.down_proj.scales"]
+        ple_scales = sanitized[
+            f"{mapped}.ple.ple_embedding.ngram_embedding.shards.0.scales"
+        ]
+        gate = mx.dequantize(gate, gate_scales, group_size=32, bits=8, mode="mxfp8")
+        up = mx.dequantize(up, up_scales, group_size=32, bits=8, mode="mxfp8")
+        down = mx.dequantize(down, down_scales, group_size=32, bits=8, mode="mxfp8")
+        ple_weight = mx.dequantize(
+            ple_weight, ple_scales, group_size=32, bits=8, mode="mxfp8"
+        )
         mx.eval(gate, up, down, ple_weight)
         self.assertEqual(gate.shape, (2, 128, 128))
         self.assertEqual(up.shape, (2, 128, 128))
         self.assertEqual(down.shape, (2, 128, 128))
-        self.assertTrue(mx.allclose(ple_weight, mx.ones((4, 8)) * 0.5).item())
-        self.assertFalse(any("scale" in key for key in sanitized))
+        self.assertTrue(mx.allclose(ple_weight, mx.ones((4, 32)) * 0.5).item())
+        self.assertFalse(any("weight_scale_inv" in key for key in sanitized))
+        self.assertTrue(any(key.endswith(".scales") for key in sanitized))
 
     def test_sanitize_leaves_non_fp8_expert_layout_unchanged(self):
         model = qwen4_exp.Model(tiny_config())

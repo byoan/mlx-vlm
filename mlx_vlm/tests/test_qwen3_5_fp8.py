@@ -55,6 +55,22 @@ def test_qwen_fp8_quantization_config_accepts_moe():
     }
 
 
+def test_qwen_fp8_quantization_config_accepts_qwen4_exp():
+    config = {
+        "model_type": "qwen4_exp",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+        },
+    }
+    assert make_quantization_config(config) == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+    }
+
+
 def test_qwen_fp8_reconstruction_requantizes_to_native_mxfp8():
     weight, scale_inv = _source_fp8_pair()
     restored = _dequantize_qwen_fp8_weight(weight, scale_inv)
