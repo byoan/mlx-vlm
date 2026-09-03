@@ -54,5 +54,28 @@ memory; the target model and checkpoint files are not modified. Quantization
 can change which tokens the drafter proposes, so acceptance should be measured
 on the intended workload even though target verification remains lossless.
 
+For large vocabularies, drafting can project only a ranked subset while target
+verification continues to use the complete vocabulary. The JSON file must be a
+list of token IDs (or an object with an `ids` list); IDs are deduplicated and
+sorted by the CLI. MXFP8 heads use 8-bit, group-size-32 quantization:
+
+```bash
+mlx_vlm.generate \
+  --model ./Qwen3.8-Flash-Next-MXFP8 \
+  --draft-model ./Qwen3.8-Flash-Next-MTP-MXFP8 \
+  --draft-kind mtp \
+  --draft-block-size 7 \
+  --draft-head-bits 8 \
+  --draft-head-mode mxfp8 \
+  --draft-vocab ./ranked-draft-vocab.json \
+  --max-tokens 128 \
+  --prompt "Explain speculative decoding in one paragraph."
+```
+
+Here `--draft-block-size 7` means one verified seed token plus at most six MTP
+proposals. Restricting the draft vocabulary can change proposal tokens and
+acceptance, especially with sampling; benchmark the intended temperature and
+prompt distribution.
+
 A locally converted target model can be supplied to `--model` in the
 generation command as well.
