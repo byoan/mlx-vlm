@@ -1,19 +1,25 @@
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen4_exp.config import TextConfig
-from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
+from mlx_vlm.models.qwen4_exp.language import (
+    BatchQSAKVCache,
+    LanguageModel,
+    Qwen4ExpDecoderLayer,
+)
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
     ModelConfig,
     Qwen4ExpMTPDraftModel,
 )
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp.split import split_qwen4_exp_mtp
-from mlx_vlm.speculative.mtp import _mtp_next_block_size
+from mlx_vlm.speculative.mtp import _mtp_next_block_size, _mtp_rounds, _mtp_rounds_batch
 
 
 def _tiny_text_config():
@@ -140,7 +146,7 @@ def test_qwen4_mtp_draft_block_uses_hyper_connection_hidden():
 
 
 @pytest.mark.parametrize("accepted", [0, 1])
-def test_qwen4_target_exposes_pre_mixer_hidden_and_replays_rejection_exactly(
+def test_qwen4_target_exposes_pre_mixer_hidden_and_restores_rejection_exactly(
     accepted,
 ):
     config = _tiny_text_config()
@@ -151,9 +157,10 @@ def test_qwen4_target_exposes_pre_mixer_hidden_and_replays_rejection_exactly(
     speculative_cache = language.make_cache()
     prefill = language(prompt, cache=speculative_cache, return_hidden=True)
     hidden, _, rollback = language.speculative_verify_hidden(verify, speculative_cache)
-    language.rollback_speculative_cache(
-        speculative_cache, rollback, accepted=accepted, block_size=3
-    )
+    with patch.object(LanguageModel, "__call__", side_effect=AssertionError("replay")):
+        language.rollback_speculative_cache(
+            speculative_cache, rollback, accepted=accepted, block_size=3
+        )
 
     reference_cache = language.make_cache()
     language(prompt, cache=reference_cache)
@@ -167,6 +174,275 @@ def test_qwen4_target_exposes_pre_mixer_hidden_and_replays_rejection_exactly(
     assert prefill.hidden_states[-1].shape == (1, 3, 64)
     assert hidden.shape == (1, 3, 64)
     assert mx.array_equal(speculative_logits, reference_logits).item()
+
+
+def _assert_cache_equal(actual, expected):
+    def compare(a, b):
+        if isinstance(a, mx.array):
+            assert isinstance(b, mx.array)
+            if mx.issubdtype(a.dtype, mx.floating):
+                assert a.dtype == b.dtype
+            assert mx.array_equal(a, b).item()
+        elif isinstance(a, (tuple, list)):
+            assert len(a) == len(b)
+            for x, y in zip(a, b):
+                compare(x, y)
+        else:
+            assert a == b
+
+    assert len(actual) == len(expected)
+    for a, b in zip(actual, expected):
+        compare(a.state, b.state)
+        compare(a.meta_state, b.meta_state)
+        if isinstance(a, ArraysCache):
+            compare(a.left_padding, b.left_padding)
+            compare(a.lengths, b.lengths)
+
+
+def _rollback_language(dtype=mx.bfloat16, head_dim=16):
+    mx.random.seed(17)
+    config = _tiny_text_config()
+    config.linear_key_head_dim = config.linear_value_head_dim = 32
+    config.head_dim = head_dim
+    config.num_hidden_layers = 3
+    config.layer_types = [
+        "linear_attention",
+        "qwen_sparse_attention",
+        "linear_attention",
+    ]
+    config.ple_layer_ids = [3]
+    config.heads_per_ngram = 2
+    config.ngram_vocab_size_base = 17
+    config.make_ngram_vocab_size_divisible_by = 4
+    config.split_ngram_parts = 4
+    config.eos_token_id = 1
+    language = LanguageModel(config, _outer_config())
+    language.set_dtype(dtype)
+    language.eval()
+    return language
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 2, 3])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_qwen4_mtp_restores_ple_and_gdn_cache_exactly(accepted, dtype, batch_size):
+    language = _rollback_language(dtype)
+    prompt = (mx.arange(batch_size * 17).reshape(batch_size, 17) % 13 + 1).astype(
+        mx.int32
+    )
+    verify = mx.array([[4, 1, 6, 7], [8, 9, 1, 10]][:batch_size], dtype=mx.int32)
+
+    def make_cache():
+        return [
+            (
+                cache
+                if isinstance(cache, ArraysCache)
+                else BatchQSAKVCache([0] * batch_size)
+            )
+            for cache in language.make_cache()
+        ]
+
+    actual = make_cache()
+    reference = make_cache()
+    language(prompt, cache=actual)
+    language(prompt, cache=reference)
+    _, _, rollback = language.speculative_verify_hidden(verify, actual)
+    forward = LanguageModel.__call__
+    replay_calls = []
+
+    def count_forward(*args, **kwargs):
+        replay_calls.append(args[1].shape[1])
+        return forward(*args, **kwargs)
+
+    with patch.object(LanguageModel, "__call__", count_forward):
+        language.rollback_speculative_cache(
+            actual, rollback, accepted=[accepted] * batch_size, block_size=4
+        )
+    assert replay_calls == ([] if batch_size == 1 else [1] * (accepted + 1))
+    for i in range(accepted + 1):
+        language(verify[:, i : i + 1], cache=reference)
+    _assert_cache_equal(actual, reference)
+
+    # Repeated decode must consume the restored PLE history, recurrent state,
+    # and QSA indexer at the same offsets as ordinary tokenwise generation.
+    for token in (11, 12, 13):
+        inputs = mx.full((batch_size, 1), token, dtype=mx.int32)
+        logits = language(inputs, cache=actual).logits
+        expected_logits = language(inputs, cache=reference).logits
+        assert mx.array_equal(logits, expected_logits).item()
+        _assert_cache_equal(actual, reference)
+
+
+@pytest.mark.parametrize("bits", [None, 4, 8])
+@pytest.mark.parametrize("prefix_length", [0, 1, 17])
+def test_qwen4_mtp_repeated_rollback_preserves_rolling_state(bits, prefix_length):
+    language = _rollback_language()
+    if bits is not None:
+        nn.quantize(
+            language,
+            group_size=32,
+            bits=bits,
+            class_predicate=lambda _, module: (
+                isinstance(module, nn.Linear) and module.weight.shape[-1] % 32 == 0
+            ),
+        )
+    actual = language.make_cache()
+    reference = language.make_cache()
+    if prefix_length:
+        prompt = mx.arange(2, prefix_length + 2, dtype=mx.int32)[None]
+        language(prompt, cache=actual)
+        language(prompt, cache=reference)
+
+    # Cross both the n-gram history and dilated-convolution window lengths,
+    # including EOS in accepted and rejected positions and QSA pool boundaries.
+    for size, accepted in ((4, 0), (4, 2), (2, 0), (8, 5), (3, 1)):
+        inputs = mx.arange(1, size + 1, dtype=mx.int32)[None]
+        _, _, rollback = language.speculative_verify_hidden(inputs, actual)
+        with patch.object(
+            LanguageModel, "__call__", side_effect=AssertionError("replay")
+        ):
+            language.rollback_speculative_cache(
+                actual, rollback, accepted=mx.array([accepted]), block_size=size
+            )
+        for i in range(accepted + 1):
+            language(inputs[:, i : i + 1], cache=reference)
+        _assert_cache_equal(actual, reference)
+        probe = mx.array([[11]], dtype=mx.int32)
+        logits = language(probe, cache=actual).logits
+        expected = language(probe, cache=reference).logits
+        assert mx.array_equal(logits, expected).item()
+
+
+@pytest.mark.parametrize("accepted", [-1, 3, [0, 1], []])
+def test_qwen4_mtp_rejects_invalid_acceptance_without_mutating_cache(accepted):
+    language = _rollback_language()
+    cache = language.make_cache()
+    language(mx.array([[2, 3]]), cache=cache)
+    _, _, rollback = language.speculative_verify_hidden(mx.array([[4, 5, 6]]), cache)
+    before = [list(entry.state) for entry in cache]
+    with pytest.raises(ValueError):
+        language.rollback_speculative_cache(cache, rollback, accepted, block_size=3)
+    after = [entry.state for entry in cache]
+    for a, b in zip(before, after):
+        for x, y in zip(a, b):
+            if isinstance(x, mx.array):
+                assert mx.array_equal(x, y).item()
+
+
+def test_qwen4_mtp_rollback_restores_recurrent_padding_metadata():
+    language = _rollback_language()
+    actual = language.make_cache()
+    reference = language.make_cache()
+    prompt = mx.array([[2, 3, 4]], dtype=mx.int32)
+    for cache in (actual, reference):
+        language(prompt, cache=cache)
+        for entry in cache:
+            if isinstance(entry, ArraysCache):
+                entry.left_padding = mx.array([-3])
+                entry.lengths = mx.array([20])
+    block = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+    _, _, rollback = language.speculative_verify_hidden(block, actual)
+    with patch.object(LanguageModel, "__call__", side_effect=AssertionError("replay")):
+        language.rollback_speculative_cache(actual, rollback, 1, block_size=4)
+    for i in range(2):
+        language(block[:, i : i + 1], cache=reference)
+    _assert_cache_equal(actual, reference)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("mrope", [False, True])
+def test_qwen4_mtp_rollback_preserves_quantized_qsa_and_positions(bits, mrope):
+    language = _rollback_language(head_dim=32)
+    prompt = mx.arange(2, 19, dtype=mx.int32)[None]
+    positions = mx.arange(prompt.shape[1], dtype=mx.int64)[None]
+    if mrope:
+        positions = mx.stack([positions, positions + 2, positions + 5])
+    language._position_ids = positions
+    language._rope_deltas = mx.array([[5 if mrope else 0]], dtype=mx.int64)
+
+    def make_cache():
+        cache = language.make_cache()
+        language(prompt, cache=cache, position_ids=positions)
+        return [
+            (
+                entry
+                if isinstance(entry, ArraysCache)
+                else entry.to_quantized(group_size=32, bits=bits)
+            )
+            for entry in cache
+        ]
+
+    actual, reference = make_cache(), make_cache()
+    block = mx.array([[3, 1, 5, 6]], dtype=mx.int32)
+    _, _, rollback = language.speculative_verify_hidden(block, actual)
+    with patch.object(LanguageModel, "__call__", side_effect=AssertionError("replay")):
+        language.rollback_speculative_cache(actual, rollback, 1, block_size=4)
+    for i in range(2):
+        language(block[:, i : i + 1], cache=reference)
+    _assert_cache_equal(actual, reference)
+    for token in (7, 8, 9):
+        inputs = mx.array([[token]], dtype=mx.int32)
+        logits = language(inputs, cache=actual).logits
+        expected = language(inputs, cache=reference).logits
+        assert mx.array_equal(logits, expected).item()
+        _assert_cache_equal(actual, reference)
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_qwen4_mtp_rounds_match_serial_without_target_replay(batched):
+    language = _rollback_language()
+    drafter = Qwen4ExpMTPDraftModel(
+        ModelConfig(text_config=language.args, block_size=4)
+    )
+    drafter.set_dtype(mx.bfloat16)
+    drafter.eval()
+    nn.quantize(
+        drafter,
+        group_size=32,
+        bits=3,
+        class_predicate=lambda path, module: (
+            isinstance(module, nn.Linear)
+            and module.weight.shape[-1] % 32 == 0
+            and not path.endswith("mlp.gate")
+        ),
+    )
+    prompt = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
+    reference = language.make_cache()
+    logits = language(prompt, cache=reference).logits
+    expected = []
+    for _ in range(16):
+        token = int(mx.argmax(logits[:, -1], axis=-1).item())
+        expected.append(token)
+        logits = language(mx.array([[token]]), cache=reference).logits
+
+    cache = language.make_cache()
+    if batched:
+        cache = [
+            entry if isinstance(entry, ArraysCache) else BatchQSAKVCache([0])
+            for entry in cache
+        ]
+    output = language(prompt, cache=cache, return_hidden=True)
+    bonus = int(mx.argmax(output.logits[:, -1], axis=-1).item())
+    kwargs = dict(
+        first_bonus=mx.array([bonus]) if batched else bonus,
+        max_tokens=16,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        draft_block_size=4,
+        greedy_sampling=True,
+    )
+    if not batched:
+        kwargs["prompt_tokens"] = prompt
+    rounds = _mtp_rounds_batch if batched else _mtp_rounds
+    with patch.object(LanguageModel, "__call__", side_effect=AssertionError("replay")):
+        emitted = list(
+            rounds(language, drafter, cache, output.hidden_states[-1], {}, **kwargs)
+        )
+    actual = [bonus] + [tokens[0] if batched else tokens for tokens, _ in emitted]
+    assert actual == expected
+    assert any(
+        accepted < drafted
+        for accepted, drafted in zip(drafter.accept_lens, drafter.draft_lens)
+    )
 
 
 def test_qwen4_speculative_verifier_matches_tokenwise_hidden_and_logits():
