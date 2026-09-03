@@ -149,6 +149,50 @@ def test_qwen4_mtp_can_use_private_quantized_draft_head():
     assert drafter._draft_lm_head is first_draft_head
 
 
+@pytest.mark.parametrize("bits, mode", [(4, "affine"), (8, "mxfp8")])
+@pytest.mark.parametrize("greedy", [True, False])
+def test_qwen4_mtp_can_use_ranked_private_draft_vocabulary(bits, mode, greedy):
+    config = _tiny_text_config()
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
+    target_head = nn.Linear(32, 64, bias=False)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            args=config,
+            model=SimpleNamespace(embed_tokens=nn.Embedding(64, 32)),
+            lm_head=target_head,
+        )
+    )
+    vocab_ids = [1, 7, 19, 42]
+
+    drafter.configure_draft_lm_head(bits=bits, mode=mode, vocab_ids=vocab_ids)
+    drafter.bind(target)
+
+    assert drafter._draft_lm_head.weight.shape[0] == len(vocab_ids)
+    hidden = mx.random.normal((1, 1, 32)).astype(mx.bfloat16)
+    compact_logits = drafter._draft_lm_head(hidden)
+    if greedy:
+        expected_local = mx.argmax(compact_logits, axis=-1)
+        sampler = None
+    else:
+        expected_local = mx.array([[2]])
+        sampler = lambda _: expected_local
+    expected = mx.take(mx.array(vocab_ids), expected_local)
+    actual = drafter._sample_hidden(hidden, sampler, greedy=greedy)
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_qwen4_mtp_rejects_invalid_ranked_draft_vocabulary():
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        drafter.configure_draft_lm_head(bits=4, vocab_ids=[])
+    with pytest.raises(ValueError, match="unique and sorted"):
+        drafter.configure_draft_lm_head(bits=4, vocab_ids=[2, 1])
+    with pytest.raises(ValueError, match="non-negative"):
+        drafter.configure_draft_lm_head(bits=4, vocab_ids=[-1, 2])
+
+
 def test_qwen4_mtp_rejects_invalid_draft_head_quantization():
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
 

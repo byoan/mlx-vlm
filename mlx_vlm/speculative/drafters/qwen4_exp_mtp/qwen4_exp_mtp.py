@@ -1,5 +1,5 @@
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -68,6 +68,8 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         self._draft_lm_head = None
         self._draft_lm_head_key = None
         self._draft_lm_head_quantization = None
+        self._draft_vocab_ids = None
+        object.__setattr__(self, "_draft_vocab_ids_array", None)
         self._cache: List[QSAKVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -85,15 +87,30 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         bits: int,
         group_size: int = 32,
         mode: str = "affine",
+        vocab_ids: Optional[Sequence[int]] = None,
     ) -> None:
-        """Use a private quantized copy of the target head for drafting."""
+        """Use a private quantized copy of target-head rows for drafting."""
         if bits not in range(2, 9):
             raise ValueError("draft LM-head bits must be between 2 and 8")
         if group_size <= 0 or self.args.hidden_size % group_size:
             raise ValueError(
                 "draft LM-head group size must divide the model hidden size"
             )
+        if vocab_ids is not None:
+            vocab_ids = tuple(int(token) for token in vocab_ids)
+            if not vocab_ids:
+                raise ValueError("draft vocabulary must not be empty")
+            if any(token < 0 for token in vocab_ids):
+                raise ValueError("draft vocabulary token IDs must be non-negative")
+            if any(a >= b for a, b in zip(vocab_ids, vocab_ids[1:])):
+                raise ValueError("draft vocabulary token IDs must be unique and sorted")
         self._draft_lm_head_quantization = (group_size, bits, mode)
+        self._draft_vocab_ids = vocab_ids
+        object.__setattr__(
+            self,
+            "_draft_vocab_ids_array",
+            None if vocab_ids is None else mx.array(vocab_ids, dtype=mx.uint32),
+        )
         self._draft_lm_head = None
         self._draft_lm_head_key = None
 
@@ -109,9 +126,23 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
                 "Qwen4 draft LM-head quantization requires a dense target LM head"
             )
         group_size, bits, mode = quantization
-        key = (id(target_head.weight), group_size, bits, mode)
+        vocab_ids = self._draft_vocab_ids
+        if vocab_ids is not None and vocab_ids[-1] >= target_head.weight.shape[0]:
+            raise ValueError("draft vocabulary token ID exceeds target vocabulary size")
+        key = (id(target_head.weight), group_size, bits, mode, id(vocab_ids))
         if self._draft_lm_head is None or self._draft_lm_head_key != key:
-            self._draft_lm_head = target_head.to_quantized(
+            draft_head = target_head
+            if vocab_ids is not None:
+                draft_head = nn.Linear(
+                    target_head.weight.shape[1],
+                    len(vocab_ids),
+                    bias=getattr(target_head, "bias", None) is not None,
+                )
+                vocab_array = self._draft_vocab_ids_array
+                draft_head.weight = mx.take(target_head.weight, vocab_array, axis=0)
+                if getattr(target_head, "bias", None) is not None:
+                    draft_head.bias = mx.take(target_head.bias, vocab_array, axis=0)
+            self._draft_lm_head = draft_head.to_quantized(
                 group_size=group_size,
                 bits=bits,
                 mode=mode,
@@ -122,13 +153,17 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         return self
 
     def _sample_hidden(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
+        token = None
         if greedy and self._draft_lm_head is not None:
             token = _QWEN4_EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
                 self._draft_lm_head, hidden
             )
-            if token is not None:
-                return token
-        return super()._sample_hidden(hidden, sampler, greedy)
+        if token is None:
+            logits = self._lm_head_fn(hidden)
+            token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+        if self._draft_vocab_ids is not None:
+            token = mx.take(self._draft_vocab_ids_array, token)
+        return token
 
     @property
     def quant_predicate(self):
