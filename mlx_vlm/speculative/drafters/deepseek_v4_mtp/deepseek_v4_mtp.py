@@ -243,9 +243,12 @@ class DeepseekV4MTPDraftModel(nn.Module):
         return self._forward_tokens(tok, hidden, token_dtype)
 
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
-        logits = self._lm_head_fn(hidden)
-        self._seed_token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+        self._seed_token = self._sample_hidden(hidden, sampler, greedy)
         self._seed_hidden = hidden
+
+    def _sample_hidden(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
+        logits = self._lm_head_fn(hidden)
+        return mx.argmax(logits, axis=-1) if greedy else sampler(logits)
 
     def prefill_from_target_hidden(
         self,
@@ -436,8 +439,7 @@ class DeepseekV4MTPDraftModel(nn.Module):
         while len(tokens) < block_size - 1:
             logits_hidden, h_prev = self._forward_token(tok, h_prev, token_dtype)
             self._round_appended += 1
-            logits = self._lm_head_fn(logits_hidden)
-            tok = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+            tok = self._sample_hidden(logits_hidden, sampler, greedy)
             tokens.append(tok)
 
         self._draft_round += 1

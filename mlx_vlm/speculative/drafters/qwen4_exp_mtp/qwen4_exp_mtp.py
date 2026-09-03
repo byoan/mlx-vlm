@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 from ....models.qwen3_5.language import _create_qwen3_5_attention_mask
 from ....models.qwen4_exp.language import (
+    _QWEN4_EXACT_SPECULATIVE_VERIFIER,
     QSAKVCache,
     Qwen4ExpDecoderLayer,
     Qwen4ExpGatedResidual,
@@ -119,6 +120,15 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
             self._draft_lm_head_key = key
         self._lm_head_fn = self._draft_lm_head
         return self
+
+    def _sample_hidden(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
+        if greedy and self._draft_lm_head is not None:
+            token = _QWEN4_EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
+                self._draft_lm_head, hidden
+            )
+            if token is not None:
+                return token
+        return super()._sample_hidden(hidden, sampler, greedy)
 
     @property
     def quant_predicate(self):
