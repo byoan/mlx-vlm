@@ -118,6 +118,40 @@ def test_qwen4_mtp_uses_requested_block_size_as_adaptive_ceiling():
     assert _mtp_next_block_size(drafter, 4, 2, 32) == 2
 
 
+def test_qwen4_mtp_can_use_private_quantized_draft_head():
+    config = _tiny_text_config()
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
+    target_head = nn.Linear(32, 64, bias=False)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            args=config,
+            model=SimpleNamespace(embed_tokens=nn.Embedding(64, 32)),
+            lm_head=target_head,
+        )
+    )
+
+    drafter.configure_draft_lm_head(bits=4)
+    drafter.bind(target)
+    first_draft_head = drafter._draft_lm_head
+
+    assert isinstance(first_draft_head, nn.QuantizedLinear)
+    assert first_draft_head.bits == 4
+    assert drafter._lm_head_fn is first_draft_head
+    assert target.language_model.lm_head is target_head
+
+    drafter.bind(target)
+    assert drafter._draft_lm_head is first_draft_head
+
+
+def test_qwen4_mtp_rejects_invalid_draft_head_quantization():
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
+
+    with pytest.raises(ValueError, match="bits must be between 2 and 8"):
+        drafter.configure_draft_lm_head(bits=1)
+    with pytest.raises(ValueError, match="must divide the model hidden size"):
+        drafter.configure_draft_lm_head(bits=4, group_size=24)
+
+
 def test_qwen4_mtp_draft_block_uses_hyper_connection_hidden():
     config = _tiny_text_config()
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))

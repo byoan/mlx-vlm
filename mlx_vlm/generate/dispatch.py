@@ -601,6 +601,13 @@ def parse_arguments():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--draft-head-bits",
+        type=int,
+        choices=range(2, 9),
+        default=None,
+        help="Use a private quantized LM head for drafting when supported.",
+    )
+    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         help=(
@@ -1357,6 +1364,19 @@ def main():
             )
             draft_model = None
             args.draft_kind = None
+        if draft_model is not None and args.draft_head_bits is not None:
+            configure_head = getattr(draft_model, "configure_draft_lm_head", None)
+            if configure_head is None:
+                raise ValueError(
+                    f"{type(draft_model).__name__} does not support "
+                    "--draft-head-bits"
+                )
+            configure_head(args.draft_head_bits)
+            draft_model.bind(model)
+            print(
+                "  → using a private "
+                f"{args.draft_head_bits}-bit affine draft LM head."
+            )
 
     prompt = args.prompt
 
