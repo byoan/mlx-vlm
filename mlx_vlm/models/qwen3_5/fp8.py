@@ -18,7 +18,7 @@ def make_quantization_config(config: dict) -> dict | None:
     """Return the native MLX config for a supported Qwen FP8 checkpoint."""
     quantization = config.get("quantization_config") or {}
     is_supported = (
-        config.get("model_type") in {"qwen3_5", "qwen3_5_moe"}
+        config.get("model_type") in {"qwen3_5", "qwen3_5_moe", "qwen4_exp"}
         and isinstance(quantization, dict)
         and quantization.get("quant_method") == "fp8"
         and quantization.get("fmt", "e4m3") == "e4m3"
