@@ -27,7 +27,13 @@ class Qwen4ExpMTPSplitter(MTPSplitter):
         self, tensors: Dict[str, mx.array], text_config: dict
     ) -> Dict[str, mx.array]:
         del text_config
-        return convert_qwen4_exp_fp8_weights(tensors)
+        return convert_qwen4_exp_fp8_weights(tensors, native_mxfp8=True)
+
+    def quantization_from_source(self, tensors, source_config):
+        del source_config
+        if any(key.endswith(".scales") for key in tensors):
+            return {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+        return None
 
 
 def split_qwen4_exp_mtp(source: str, output: str, **kwargs):
