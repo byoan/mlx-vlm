@@ -3,6 +3,108 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+# The radix-selection structure is adapted from ds4-metal's Qwen4 Metal path.
+# Portions copyright (c) 2026 The ds4.c authors, used under the MIT License.
+_TOPK_SOURCE = r"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint row_id = threadgroup_position_in_grid.y;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    device const float *row = scores + row_id * N;
+    device int *out = selected + row_id * K;
+
+    threadgroup atomic_uint hist[256];
+    threadgroup uint scan[8];
+    threadgroup uint found[2];
+    uint prefix = 0;
+    uint need = K;
+
+    for (uint pass = 0; pass < 4; ++pass) {
+        uint shift = 24 - 8 * pass;
+        uint mask_hi = pass == 0 ? 0 : (0xffffffffu << (shift + 8));
+        atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint base = tid; base < N; base += 16 * 256) {
+            float values[16];
+            for (uint u = 0; u < 16; ++u) {
+                uint index = base + u * 256;
+                values[u] = index < N ? row[index] : -1.0f;
+            }
+            for (uint u = 0; u < 16; ++u) {
+                uint index = base + u * 256;
+                if (index >= N) break;
+                uint key = as_type<uint>(max(values[u], 0.0f));
+                if ((key & mask_hi) == prefix) {
+                    atomic_fetch_add_explicit(
+                        &hist[(key >> shift) & 0xffu], 1u,
+                        memory_order_relaxed);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint count = atomic_load_explicit(
+            &hist[255 - tid], memory_order_relaxed);
+        uint partial = simd_prefix_inclusive_sum(count);
+        if (lane == 31) scan[sg] = partial;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint above = partial - count;
+        for (uint group = 0; group < sg; ++group) above += scan[group];
+        if (above < need && above + count >= need) {
+            found[0] = prefix | ((255u - tid) << shift);
+            found[1] = need - above;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix = found[0];
+        need = found[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint chunk = (N + 255) / 256;
+    uint end = N - min(tid * chunk, uint(N));
+    uint begin = N - min((tid + 1) * chunk, uint(N));
+    uint greater = 0;
+    uint equal = 0;
+    for (uint cursor = end; cursor > begin;) {
+        uint index = --cursor;
+        uint key = as_type<uint>(max(row[index], 0.0f));
+        greater += key > prefix;
+        equal += key == prefix;
+    }
+
+    uint greater_rank;
+    uint equal_rank;
+    for (uint which = 0; which < 2; ++which) {
+        uint value = which == 0 ? greater : equal;
+        uint partial_rank = simd_prefix_exclusive_sum(value);
+        if (lane == 31) scan[sg] = partial_rank + value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            uint group_value = lane < 8 ? scan[lane] : 0;
+            uint group_rank = simd_prefix_exclusive_sum(group_value);
+            if (lane < 8) scan[lane] = group_rank;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (which == 0) greater_rank = partial_rank + scan[sg];
+        else equal_rank = partial_rank + scan[sg];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint equal_base = K - need;
+    for (uint cursor = end; cursor > begin;) {
+        uint index = --cursor;
+        uint key = as_type<uint>(max(row[index], 0.0f));
+        if (key > prefix) out[greater_rank++] = int(index);
+        else if (key == prefix) {
+            if (equal_rank < need) {
+                out[equal_base + equal_rank] = int(index);
+            }
+            ++equal_rank;
+        }
+    }
+"""
+
 _PASS1_SOURCE = r"""
     uint kv_head = threadgroup_position_in_grid.x;
     uint batch = threadgroup_position_in_grid.y;
@@ -161,6 +263,17 @@ def _kernels(dtype, head_dim, q_heads, kv_heads):
     )
 
 
+@lru_cache(maxsize=1)
+def _topk_kernel():
+    return mx.fast.metal_kernel(
+        name="qwen4_exact_sparse_qsa_radix_topk",
+        input_names=["scores"],
+        output_names=["selected"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=_TOPK_SOURCE,
+    )
+
+
 @lru_cache(maxsize=32)
 def _scalars(scale, k_head_stride, v_head_stride):
     return (
@@ -187,6 +300,32 @@ def enabled():
         and blocks in ("", "0", "1024")
         and _is_m3_ultra()
     )
+
+
+def select_blocks(scores, topk):
+    """Select QSA blocks with an M3 Ultra top-512 radix kernel when enabled."""
+    if (
+        os.environ.get("MLX_VLM_QWEN4_RADIX_QSA_TOPK") != "1"
+        or not enabled()
+        or scores.dtype != mx.float32
+        or scores.ndim != 3
+        or scores.shape[0] != 1
+        or topk != 512
+        or scores.shape[-1] < 16_384
+    ):
+        return None
+
+    rows = scores.shape[1]
+    blocks = scores.shape[2]
+    selected = _topk_kernel()(
+        inputs=[mx.contiguous(scores.reshape(rows, blocks))],
+        template=[("N", blocks), ("K", topk)],
+        grid=(256, rows, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, topk)],
+        output_dtypes=[mx.int32],
+    )[0]
+    return selected.reshape(1, rows, topk)
 
 
 def _selected_positions(selection, query_index):

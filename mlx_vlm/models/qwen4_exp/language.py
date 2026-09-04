@@ -31,6 +31,7 @@ from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 from .exact_sparse_qsa import Qwen4ExactSparseSelection
 from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
+from .exact_sparse_qsa import select_blocks as select_exact_sparse_qsa_blocks
 
 
 def _append_indexer_positions(
@@ -974,9 +975,11 @@ class Qwen4ExpQSAIndexer(nn.Module):
         complete_counts = visible_counts // self.compress_ratio
         valid_blocks = block_ids[None, None] < complete_counts[..., None]
         scores = mx.where(valid_blocks, scores, -mx.inf)
-        selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
-            ..., -self.block_topk :
-        ]
+        selected_blocks = select_exact_sparse_qsa_blocks(scores, self.block_topk)
+        if selected_blocks is None:
+            selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
+                ..., -self.block_topk :
+            ]
 
         if (
             return_selection

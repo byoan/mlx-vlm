@@ -104,6 +104,12 @@ attention layout. It preserves MLX's 1,024-partition accumulation order and
 falls back to the regular attention path for unsupported shapes, devices,
 cache layouts, or `MLX_SDPA_BLOCKS` overrides.
 
+The same M3 Ultra path can replace generic QSA block partitioning with a
+fixed top-512 radix selector by also setting
+`MLX_VLM_QWEN4_RADIX_QSA_TOPK=1`. It keeps the existing FP32 scores and MLX
+cutoff-tie behavior, and falls back to `argpartition` outside the checkpoint's
+long-context single-request verification layout.
+
 Verification can also combine the hyper-connection mix and injection
 projections by setting `MLX_VLM_QWEN4_COMBINED_HYPER_PROJECTION=1`. This keeps
 the singleton evaluation order used by exact verification while sharing the
