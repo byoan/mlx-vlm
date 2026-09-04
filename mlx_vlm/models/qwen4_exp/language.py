@@ -13,6 +13,7 @@ from mlx.utils import tree_map
 
 from ..base import LanguageModelOutput
 from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
+from ..exact_speculative_verify import exact_speculative_verify_weight
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
@@ -1642,7 +1643,15 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
     def _normalize_gated_delta_qk(layer, q, k):
         return layer._normalize_qk(q, k)
 
-    def _combined_projection(self, module, hidden_states, linears, cache_name):
+    def _combined_projection(
+        self,
+        module,
+        hidden_states,
+        linears,
+        cache_name,
+        *,
+        exact_padded=False,
+    ):
         cache = getattr(self, cache_name, None)
         if cache is None:
             cache = {}
@@ -1658,11 +1667,19 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
                     cache.pop(key, None)
 
             module_ref = weakref.ref(module, discard)
+            output_size = sum(linear.weight.shape[0] for linear in linears)
             weight = mx.concatenate([linear.weight for linear in linears], axis=0)
-            entry = (module_ref, weight)
+            if exact_padded and output_size % 4:
+                weight = mx.pad(weight, [(0, 4 - output_size % 4), (0, 0)])
+            entry = (module_ref, weight, output_size)
             cache[key] = entry
 
         weight = entry[1]
+        output_size = entry[2]
+        if exact_padded:
+            output = exact_speculative_verify_weight(weight, hidden_states)
+            if output is not None:
+                return output[..., :output_size]
         return mx.concatenate(
             [
                 hidden_states[:, index : index + 1] @ weight.T
@@ -1713,11 +1730,17 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         return mixed, hidden_states, injection
 
     def _combined_moe_gate_projection(self, module, hidden_states):
+        exact_padded = os.environ.get("MLX_VLM_QWEN4_PADDED_MOE_GATE_KERNEL") == "1"
         return self._combined_projection(
             module,
             hidden_states,
             (module.gate, module.shared_expert_gate),
-            "_combined_moe_gate_projection_cache",
+            (
+                "_combined_moe_gate_padded_projection_cache"
+                if exact_padded
+                else "_combined_moe_gate_projection_cache"
+            ),
+            exact_padded=exact_padded,
         )
 
     def _feed_forward(self, feed_forward, hidden_states):

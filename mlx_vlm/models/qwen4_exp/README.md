@@ -122,6 +122,13 @@ adds about 0.13 GB for the 48-layer checkpoint. Both combined-projection flags
 only affect multi-token exact verification and retain the normal fallback for
 other dtypes and shapes.
 
+On Metal, `MLX_VLM_QWEN4_PADDED_MOE_GATE_KERNEL=1` can additionally pad the
+checkpoint's 513-row combined router projection to 516 rows and use the exact
+multi-token BF16 verification kernel. The padded rows are discarded. This
+requires `MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION=1`, preserves the
+singleton accumulation and rounding order, and falls back for unsupported
+dtypes or shapes.
+
 Finally, the two 48-value gated-delta control projections can share a 96-row
 BF16 projection by setting `MLX_VLM_QWEN4_COMBINED_GDN_AB_PROJECTION=1`. This
 adds about 18 MB for the checkpoint's 36 gated-delta layers and leaves the
