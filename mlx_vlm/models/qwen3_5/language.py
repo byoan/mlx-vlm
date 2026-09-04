@@ -2114,12 +2114,45 @@ class LanguageModel(nn.Module):
             return out
         return self.lm_head(hidden)
 
+    def configure_tokenizer_vocab_size(self, vocab_size: int) -> None:
+        """Exclude padded LM-head rows that do not map to tokenizer IDs."""
+        vocab_size = int(vocab_size)
+        if vocab_size <= 0:
+            raise ValueError("tokenizer vocabulary size must be positive")
+        self._tokenizer_vocab_size = vocab_size
+        object.__setattr__(self, "_tokenizer_vocab_mask", None)
+
+    def _tokenizer_token_mask(self, rows: int, head_size: int) -> Optional[mx.array]:
+        vocab_size = getattr(self, "_tokenizer_vocab_size", None)
+        if vocab_size is None or vocab_size >= head_size:
+            return None
+        token_mask = getattr(self, "_tokenizer_vocab_mask", None)
+        if token_mask is None:
+            full_words, remainder = divmod(vocab_size, 32)
+            parts = [mx.full((1, full_words), -1, dtype=mx.int32)]
+            if remainder:
+                parts.append(mx.array([[(1 << remainder) - 1]], dtype=mx.int32))
+            tail_words = (head_size + 31) // 32 - full_words - bool(remainder)
+            if tail_words:
+                parts.append(mx.zeros((1, tail_words), dtype=mx.int32))
+            token_mask = mx.concatenate(parts, axis=1)
+            object.__setattr__(self, "_tokenizer_vocab_mask", token_mask)
+        return mx.contiguous(mx.broadcast_to(token_mask, (rows, token_mask.shape[1])))
+
     def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
         if not self.args.tie_word_embeddings:
-            out = _EXACT_SPECULATIVE_VERIFIER.quantized_argmax(self.lm_head, hidden)
+            token_mask = LanguageModel._tokenizer_token_mask(
+                self, hidden.shape[0] * hidden.shape[1], self.lm_head.weight.shape[0]
+            )
+            out = _EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
+                self.lm_head, hidden, token_mask=token_mask
+            )
             if out is not None:
                 return out
         logits = self.speculative_logits_from_hidden(hidden)
+        vocab_size = getattr(self, "_tokenizer_vocab_size", None)
+        if vocab_size is not None:
+            logits = logits[..., :vocab_size]
         return mx.argmax(logits, axis=-1)
 
     def supports_fused_greedy_logits_processors(self, logits_processors) -> bool:
@@ -2166,6 +2199,15 @@ class LanguageModel(nn.Module):
             token_mask = _EXACT_SPECULATIVE_VERIFIER.pad_token_mask(
                 token_mask, self.lm_head.weight.shape[0]
             )
+        tokenizer_mask = LanguageModel._tokenizer_token_mask(
+            self, inputs.shape[0], self.lm_head.weight.shape[0]
+        )
+        if tokenizer_mask is not None:
+            token_mask = (
+                tokenizer_mask
+                if token_mask is None
+                else mx.bitwise_and(token_mask, tokenizer_mask)
+            )
 
         output = self(
             inputs,
@@ -2182,7 +2224,11 @@ class LanguageModel(nn.Module):
             return sampled
         if token_mask is not None:
             raise RuntimeError("masked fused greedy decode became unsupported")
-        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
+        logits = self.speculative_logits_from_hidden(hidden)
+        vocab_size = getattr(self, "_tokenizer_vocab_size", None)
+        if vocab_size is not None:
+            logits = logits[..., :vocab_size]
+        return mx.argmax(logits, axis=-1)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(

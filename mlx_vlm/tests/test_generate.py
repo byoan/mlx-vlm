@@ -542,6 +542,40 @@ class TestBatchGenerator:
         assert len(gen._generation_batch) == 0
         assert gen.uid_count == 0
 
+    def test_sampler_excludes_padded_model_vocabulary_rows(self, mock_model):
+        processor = MockProcessor()
+        processor.tokenizer.vocab = {str(token): token for token in range(5)}
+        sampler = MagicMock(return_value=mx.array([4]))
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=processor,
+            sampler=sampler,
+        )
+
+        gen.sampler(mx.zeros((1, 8)))
+
+        assert sampler.call_args.args[0].shape == (1, 5)
+
+    def test_vocab_limited_sampler_preserves_positioned_sampling(self):
+        sampler = SimpleNamespace(
+            __call__=lambda logits: mx.argmax(logits, axis=-1),
+            sample_target=MagicMock(return_value=mx.array([1])),
+            sample_proposal=MagicMock(return_value=mx.array([2])),
+        )
+        # SimpleNamespace itself is not callable; use a callable mock while
+        # retaining both positioned entry points.
+        callable_sampler = MagicMock(return_value=mx.array([0]))
+        callable_sampler.sample_target = sampler.sample_target
+        callable_sampler.sample_proposal = sampler.sample_proposal
+        limited = ar_module._limit_sampler_vocab(callable_sampler, 5)
+        logits = mx.zeros((1, 8))
+
+        limited.sample_target(logits, row_ids=[7], positions=[11])
+        limited.sample_proposal(logits, row_ids=[7], positions=[11])
+
+        assert sampler.sample_target.call_args.args[0].shape == (1, 5)
+        assert sampler.sample_proposal.call_args.args[0].shape == (1, 5)
+
     def test_insert_prompts(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,

@@ -830,6 +830,39 @@ def test_qwen_fused_greedy_decode_uses_quantized_argmax():
     ]
 
 
+def test_qwen_fused_greedy_decode_excludes_padded_tokenizer_rows():
+    hidden = mx.ones((2, 1, 512), dtype=mx.bfloat16)
+
+    class Model:
+        args = SimpleNamespace(tie_word_embeddings=False)
+
+        def __init__(self):
+            head = nn.Linear(512, 16, bias=False)
+            head.weight = mx.concatenate(
+                [mx.zeros((13, 512)), mx.ones((3, 512))], axis=0
+            )
+            self.lm_head = head.to_quantized(group_size=32, bits=4)
+            self.lm_head.scales = self.lm_head.scales.astype(mx.bfloat16)
+            self.lm_head.biases = self.lm_head.biases.astype(mx.bfloat16)
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            return SimpleNamespace(hidden_states=[hidden])
+
+        def speculative_logits_from_hidden(self, value):
+            return self.lm_head(value)
+
+    model = Model()
+    qwen_language.LanguageModel.configure_tokenizer_vocab_size(model, 13)
+    raw_token = mx.argmax(model.lm_head(hidden), axis=-1)
+    token = qwen_language.LanguageModel.fused_greedy_decode(
+        model, mx.array([[1], [2]], dtype=mx.int32), cache=[]
+    )
+    mx.eval(raw_token, token)
+
+    assert all(value >= 13 for value in raw_token.reshape(-1).tolist())
+    assert token.reshape(-1).tolist() == [0, 0]
+
+
 def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
     for bits in (4, 5):
         mx.random.seed(170 + bits)
@@ -1806,6 +1839,44 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
     assert accepted == [0, 0]
     assert new_tokens == [[2], [1]]
     assert fake_head.calls == 1
+
+
+def test_speculative_walk_batch_deferred_uniform_uses_positioned_target_sampler():
+    class PositionedSampler:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, _logprobs):
+            raise AssertionError("positioned sampling must not use mutable RNG")
+
+        def sample_target(self, logprobs, *, row_ids, positions):
+            self.calls.append((list(row_ids), list(positions)))
+            return mx.argmax(logprobs, axis=-1)
+
+    sampler = PositionedSampler()
+    lm = SimpleNamespace(speculative_logits_from_hidden=lambda hidden: hidden)
+    target_hidden = mx.array(
+        [
+            [[0, 0, 9, 0], [0, 0, 0, 9]],
+            [[0, 0, 9, 0], [0, 0, 0, 9]],
+        ],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2], [2]], dtype=mx.int32)
+
+    accepted, new_tokens = mtp_utils._speculative_walk_batch_deferred_uniform(
+        lm,
+        target_hidden,
+        draft_tokens,
+        sampler,
+        budgets=[2, 2],
+        row_ids=[7, 7],
+        base_positions=[11, 11],
+    )
+
+    assert accepted == [1, 1]
+    assert new_tokens == [[2, 3], [2, 3]]
+    assert sampler.calls == [([7, 7], [11, 11]), ([7, 7], [12, 12])]
 
 
 def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):

@@ -199,6 +199,32 @@ def test_qwen4_mtp_can_use_private_quantized_draft_head():
 
 
 @pytest.mark.parametrize("bits, mode", [(4, "affine"), (8, "mxfp8")])
+def test_qwen4_mtp_private_head_excludes_padded_tokenizer_rows(bits, mode):
+    config = _tiny_text_config()
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
+    target_head = nn.Linear(32, 64, bias=False)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            args=config,
+            model=SimpleNamespace(embed_tokens=nn.Embedding(64, 32)),
+            lm_head=target_head,
+        )
+    )
+    target_head.weight = mx.concatenate([mx.zeros((60, 32)), mx.ones((4, 32))], axis=0)
+
+    drafter.configure_draft_lm_head(bits=bits, mode=mode)
+    drafter.bind(target)
+    drafter.configure_tokenizer_vocab_size(60)
+    hidden = mx.ones((2, 1, 32))
+    raw_token = mx.argmax(drafter._draft_lm_head(hidden), axis=-1)
+    token = drafter._sample_hidden(hidden, None, greedy=True)
+    mx.eval(raw_token, token)
+
+    assert all(value >= 60 for value in raw_token.reshape(-1).tolist())
+    assert token.reshape(-1).tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("bits, mode", [(4, "affine"), (8, "mxfp8")])
 @pytest.mark.parametrize("greedy", [True, False])
 def test_qwen4_mtp_can_use_ranked_private_draft_vocabulary(bits, mode, greedy):
     config = _tiny_text_config()
@@ -612,6 +638,92 @@ def test_qwen4_speculative_verifier_matches_tokenwise_hidden_and_logits():
         mx.argmax(batched_logits, axis=-1),
         mx.argmax(tokenwise_logits, axis=-1),
     ).item()
+
+
+def test_qwen4_multirow_speculative_verifier_avoids_long_cache_snapshot():
+    config = _tiny_text_config()
+    language = LanguageModel(config, _outer_config())
+    prompt = mx.array([[1, 2, 3], [7, 8, 9]], dtype=mx.int32)
+    verify = mx.array([[4, 5, 6], [10, 11, 12]], dtype=mx.int32)
+
+    speculative_cache = [
+        entry if isinstance(entry, ArraysCache) else BatchQSAKVCache([0, 0])
+        for entry in language.make_cache()
+    ]
+    language(prompt, cache=speculative_cache)
+
+    with patch.object(
+        language,
+        "_snapshot_speculative_cache",
+        side_effect=AssertionError("multi-row verifier copied the prompt cache"),
+    ):
+        hidden, _, rollback, logits = language.speculative_verify_logits(
+            verify, speculative_cache, lambda value: value
+        )
+
+    reference_cache = [
+        entry if isinstance(entry, ArraysCache) else BatchQSAKVCache([0, 0])
+        for entry in language.make_cache()
+    ]
+    language(prompt, cache=reference_cache)
+    expected_hidden = []
+    for index in range(verify.shape[1]):
+        output = language(
+            verify[:, index : index + 1],
+            cache=reference_cache,
+            return_hidden=True,
+            skip_logits=True,
+        )
+        expected_hidden.append(output.hidden_states[-1])
+    expected_hidden = mx.concatenate(expected_hidden, axis=1)
+    expected_logits = language.speculative_logits_from_hidden(expected_hidden)
+    mx.eval(hidden, logits, expected_hidden, expected_logits)
+
+    assert rollback[0] == "recurrent_replay"
+    assert all(
+        snapshot is None
+        for snapshot, cache in zip(rollback[1], speculative_cache)
+        if not isinstance(cache, ArraysCache)
+    )
+    assert mx.allclose(hidden, expected_hidden, rtol=0, atol=1e-6).item()
+    assert mx.allclose(logits, expected_logits, rtol=0, atol=1e-6).item()
+    assert mx.array_equal(
+        mx.argmax(logits, axis=-1), mx.argmax(expected_logits, axis=-1)
+    ).item()
+
+
+def test_qwen4_multirow_verifier_materializes_cache_before_fixed_width_append():
+    from mlx_vlm.models.qwen4_exp import language as qwen4_language
+
+    language = LanguageModel(_tiny_text_config(), _outer_config())
+    prompt = mx.array([[1, 2, 3], [7, 8, 9]], dtype=mx.int32)
+    verify = mx.array([[4, 5], [10, 11]], dtype=mx.int32)
+    cache = [
+        entry if isinstance(entry, ArraysCache) else BatchQSAKVCache([0, 0])
+        for entry in language.make_cache()
+    ]
+    language(prompt, cache=cache)
+
+    events = []
+    eval_cache = mx.eval
+    verifier = qwen4_language._QWEN4_EXACT_SPECULATIVE_VERIFIER
+    verify_model = verifier._model
+
+    def record_eval(*args):
+        events.append("eval")
+        return eval_cache(*args)
+
+    def record_verify(*args, **kwargs):
+        events.append("verify")
+        return verify_model(*args, **kwargs)
+
+    with (
+        patch.object(qwen4_language.mx, "eval", side_effect=record_eval),
+        patch.object(verifier, "_model", side_effect=record_verify),
+    ):
+        language.speculative_verify_hidden(verify, cache)
+
+    assert events[:2] == ["eval", "verify"]
 
 
 def test_qwen4_fused_greedy_mixes_captured_hyper_state_before_lm_head(monkeypatch):

@@ -1603,6 +1603,8 @@ _QWEN4_EXACT_SPECULATIVE_VERIFIER = Qwen4ExpExactSpeculativeVerifier()
 
 
 class LanguageModel(Qwen3_5LanguageModel):
+    requires_multirow_speculative_replay = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
         self.args = args
@@ -1677,6 +1679,15 @@ class LanguageModel(Qwen3_5LanguageModel):
             token_mask = _QWEN4_EXACT_SPECULATIVE_VERIFIER.pad_token_mask(
                 token_mask, self.lm_head.weight.shape[0]
             )
+        tokenizer_mask = self._tokenizer_token_mask(
+            inputs.shape[0], self.lm_head.weight.shape[0]
+        )
+        if tokenizer_mask is not None:
+            token_mask = (
+                tokenizer_mask
+                if token_mask is None
+                else mx.bitwise_and(token_mask, tokenizer_mask)
+            )
 
         output = self(
             inputs,
@@ -1693,7 +1704,11 @@ class LanguageModel(Qwen3_5LanguageModel):
             return sampled
         if token_mask is not None:
             raise RuntimeError("masked fused greedy decode became unsupported")
-        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
+        logits = self.speculative_logits_from_hidden(hidden)
+        vocab_size = getattr(self, "_tokenizer_vocab_size", None)
+        if vocab_size is not None:
+            logits = logits[..., :vocab_size]
+        return mx.argmax(logits, axis=-1)
 
     @staticmethod
     def _snapshot_speculative_cache(caches):
@@ -1746,11 +1761,56 @@ class LanguageModel(Qwen3_5LanguageModel):
                 entry.state = state
                 entry.meta_state = meta_state
 
+    @staticmethod
+    def _snapshot_speculative_recurrent_cache(caches):
+        snapshots = []
+        for entry in caches:
+            if not isinstance(entry, ArraysCache):
+                snapshots.append(None)
+                continue
+            state = tree_map(
+                lambda value: mx.array(value) if isinstance(value, mx.array) else value,
+                entry.state,
+            )
+            snapshots.append(
+                (
+                    list(state),
+                    getattr(entry, "_left_padding", None),
+                    getattr(entry, "_left_padding_advance", 0),
+                    getattr(entry, "_lengths", None),
+                    getattr(entry, "_lengths_advance", 0),
+                )
+            )
+        return snapshots
+
+    @staticmethod
+    def _restore_speculative_recurrent_cache(caches, snapshots):
+        for entry, snapshot in zip(caches, snapshots):
+            if snapshot is None:
+                continue
+            (
+                state,
+                left_padding,
+                left_padding_advance,
+                lengths,
+                lengths_advance,
+            ) = snapshot
+            entry.state = list(state)
+            entry._left_padding = left_padding
+            entry._left_padding_advance = left_padding_advance
+            entry._lengths = lengths
+            entry._lengths_advance = lengths_advance
+
     def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
         batch, length = inputs.shape
-        # Multi-row verification does not yet have tokenwise-equivalent cache
-        # numerics. Preserve its restore-and-replay fallback until it does.
-        snapshot = self._snapshot_speculative_cache(cache) if batch > 1 else None
+        if batch > 1:
+            # Batch KV caches append into preallocated buffers in place.  Make
+            # the preceding prefill/replay writes visible before the verifier
+            # consumes a multi-token append on the generation stream.
+            mx.eval([entry.state for entry in cache])
+        recurrent_snapshot = (
+            self._snapshot_speculative_recurrent_cache(cache) if batch > 1 else None
+        )
         cache_entry = cache[self.model.fa_idx]
         cache_offset = getattr(cache_entry, "offset", 0)
         if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
@@ -1771,7 +1831,9 @@ class LanguageModel(Qwen3_5LanguageModel):
             skip_logits=sampler is None,
         )
         rollback_state = (
-            (snapshot, inputs) if snapshot is not None else output.gdn_states
+            ("recurrent_replay", recurrent_snapshot, inputs)
+            if recurrent_snapshot is not None
+            else output.gdn_states
         )
         hidden = output.hidden_states[-1]
         if sampler is None:
@@ -1805,6 +1867,23 @@ class LanguageModel(Qwen3_5LanguageModel):
         keep = accepted_list[0] + 1
         if not 1 <= keep <= block_size:
             raise ValueError("Qwen4-Exp accepted tokens must fit the verified block.")
+        if (
+            isinstance(rollback_state, tuple)
+            and len(rollback_state) == 3
+            and rollback_state[0] == "recurrent_replay"
+        ):
+            _, snapshots, verify_inputs = rollback_state
+            self._restore_speculative_recurrent_cache(caches, snapshots)
+            for cache in caches:
+                if not isinstance(cache, ArraysCache):
+                    cache.trim(block_size)
+            for index in range(keep):
+                self(
+                    verify_inputs[:, index : index + 1],
+                    cache=caches,
+                    skip_logits=True,
+                )
+            return accepted_list[0]
         if isinstance(rollback_state, tuple):
             snapshots, verify_inputs = rollback_state
             self._restore_speculative_cache(caches, snapshots)

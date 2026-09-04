@@ -69,6 +69,8 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         self._draft_lm_head_key = None
         self._draft_lm_head_quantization = None
         self._draft_vocab_ids = None
+        self._tokenizer_vocab_size = None
+        object.__setattr__(self, "_tokenizer_vocab_mask", None)
         object.__setattr__(self, "_draft_vocab_ids_array", None)
         self._compile_input_fusion = True
         object.__setattr__(self, "_compiled_input_fusion", None)
@@ -115,6 +117,39 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         )
         self._draft_lm_head = None
         self._draft_lm_head_key = None
+
+    def configure_tokenizer_vocab_size(self, vocab_size: int) -> None:
+        """Exclude padded LM-head rows that do not map to tokenizer IDs."""
+        vocab_size = int(vocab_size)
+        if vocab_size <= 0:
+            raise ValueError("tokenizer vocabulary size must be positive")
+        if (
+            self._draft_vocab_ids is not None
+            and self._draft_vocab_ids[-1] >= vocab_size
+        ):
+            raise ValueError("draft vocabulary token ID exceeds tokenizer vocabulary")
+        self._tokenizer_vocab_size = vocab_size
+        object.__setattr__(self, "_tokenizer_vocab_mask", None)
+
+    def _draft_head_token_mask(self, hidden: mx.array) -> Optional[mx.array]:
+        if self._draft_vocab_ids is not None or self._tokenizer_vocab_size is None:
+            return None
+        head_size = self._draft_lm_head.weight.shape[0]
+        if self._tokenizer_vocab_size >= head_size:
+            return None
+        token_mask = self._tokenizer_vocab_mask
+        if token_mask is None:
+            full_words, remainder = divmod(self._tokenizer_vocab_size, 32)
+            parts = [mx.full((1, full_words), -1, dtype=mx.int32)]
+            if remainder:
+                parts.append(mx.array([[(1 << remainder) - 1]], dtype=mx.int32))
+            tail_words = (head_size + 31) // 32 - full_words - bool(remainder)
+            if tail_words:
+                parts.append(mx.zeros((1, tail_words), dtype=mx.int32))
+            token_mask = mx.concatenate(parts, axis=1)
+            object.__setattr__(self, "_tokenizer_vocab_mask", token_mask)
+        rows = hidden.shape[0] * hidden.shape[1]
+        return mx.contiguous(mx.broadcast_to(token_mask, (rows, token_mask.shape[1])))
 
     def bind(self, target_model) -> "Qwen4ExpMTPDraftModel":
         super().bind(target_model)
@@ -185,12 +220,19 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
 
     def _sample_hidden(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
         token = None
+        vocab_size = (
+            self._tokenizer_vocab_size if self._draft_vocab_ids is None else None
+        )
         if greedy and self._draft_lm_head is not None:
             token = _QWEN4_EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
-                self._draft_lm_head, hidden
+                self._draft_lm_head,
+                hidden,
+                token_mask=self._draft_head_token_mask(hidden),
             )
         if token is None:
             logits = self._lm_head_fn(hidden)
+            if vocab_size is not None:
+                logits = logits[..., :vocab_size]
             token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
         if self._draft_vocab_ids is not None:
             token = mx.take(self._draft_vocab_ids_array, token)
