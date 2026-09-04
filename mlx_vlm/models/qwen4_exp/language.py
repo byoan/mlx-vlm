@@ -90,6 +90,7 @@ class QSAKVCache(KVCache):
         self.index_position_ids = None
         self._qsa_pooled_keys = None
         self._qsa_pooled_ratio = None
+        self._qsa_pooled_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
@@ -276,6 +277,7 @@ class BatchQSAKVCache:
         self.index_offset = 0
         self._qsa_pooled_keys = None
         self._qsa_pooled_ratio = None
+        self._qsa_pooled_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
@@ -880,11 +882,23 @@ class Qwen4ExpQSAIndexer(nn.Module):
                     ..., new_block_ids * self.compress_ratio
                 ]
                 new_keys = self._apply_rope(new_keys, new_positions)
-                pooled_keys = (
-                    new_keys
-                    if cached is None
-                    else mx.concatenate([cached, new_keys], axis=2)
-                )
+                if os.environ.get("MLX_VLM_QWEN4_PREALLOCATED_QSA_POOL") == "1":
+                    pooled_buffer = getattr(cache, "_qsa_pooled_keys_buffer", None)
+                    if pooled_buffer is None and cached is not None:
+                        pooled_buffer = cached
+                    pooled_buffer, pooled_keys = _qsa_preallocated_append(
+                        pooled_buffer,
+                        new_keys,
+                        cached_blocks,
+                        2,
+                    )
+                    cache._qsa_pooled_keys_buffer = pooled_buffer
+                else:
+                    pooled_keys = (
+                        new_keys
+                        if cached is None
+                        else mx.concatenate([cached, new_keys], axis=2)
+                    )
             else:
                 pooled_keys = cached
             cache._qsa_pooled_keys = pooled_keys

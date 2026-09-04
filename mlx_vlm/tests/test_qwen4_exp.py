@@ -443,6 +443,43 @@ class Qwen4ExpTests(unittest.TestCase):
             quantized = cache.to_quantized(group_size=32, bits=8)
             self.assertEqual(quantized.index_keys.shape, (1, 4, 8))
 
+    def test_preallocated_qsa_pool_reuses_capacity_after_trim(self):
+        model = qwen4_exp.Model(tiny_config())
+        indexer = model.language_model.model.layers[1].self_attn.indexer
+        cache = QSAKVCache()
+        prefix_qk = mx.arange(240, dtype=mx.float32).reshape(1, 10, 24) / 240
+        decode_qk = mx.arange(48, dtype=mx.float32).reshape(1, 2, 24) / 48
+
+        with patch.dict(
+            "os.environ",
+            {
+                "MLX_VLM_QWEN4_INCREMENTAL_QSA_POOL": "1",
+                "MLX_VLM_QWEN4_PREALLOCATED_QSA_POOL": "1",
+            },
+        ):
+            indexer.from_projected(
+                prefix_qk, cache, mx.arange(10, dtype=mx.int32)[None]
+            )
+            cache.update_and_fetch(mx.zeros((1, 2, 10, 8)), mx.zeros((1, 2, 10, 8)))
+            first = indexer.from_projected(
+                decode_qk, cache, mx.arange(10, 12, dtype=mx.int32)[None]
+            )
+            cache.update_and_fetch(mx.zeros((1, 2, 2, 8)), mx.zeros((1, 2, 2, 8)))
+            buffer = cache._qsa_pooled_keys_buffer
+
+            self.assertEqual(cache._qsa_pooled_keys.shape[2], 6)
+            self.assertEqual(buffer.shape[2], 256)
+
+            cache.trim(2)
+            second = indexer.from_projected(
+                decode_qk, cache, mx.arange(10, 12, dtype=mx.int32)[None]
+            )
+            mx.eval(first, second)
+
+            self.assertIs(cache._qsa_pooled_keys_buffer, buffer)
+            self.assertEqual(cache._qsa_pooled_keys.shape[2], 6)
+            self.assertTrue(mx.array_equal(first, second).item())
+
     def test_qsa_cache_merges_ragged_rows_and_round_trips_extract(self):
         rows = []
         for length in (3, 1):
