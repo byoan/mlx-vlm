@@ -1639,11 +1639,11 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
     def _normalize_gated_delta_qk(layer, q, k):
         return layer._normalize_qk(q, k)
 
-    def _combined_hyper_projection(self, module, normed):
-        cache = getattr(self, "_combined_hyper_projection_cache", None)
+    def _combined_projection(self, module, hidden_states, linears, cache_name):
+        cache = getattr(self, cache_name, None)
         if cache is None:
             cache = {}
-            self._combined_hyper_projection_cache = cache
+            setattr(self, cache_name, cache)
 
         key = id(module)
         entry = cache.get(key)
@@ -1655,23 +1655,25 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
                     cache.pop(key, None)
 
             module_ref = weakref.ref(module, discard)
-            weight = mx.concatenate(
-                [
-                    module.input_mix_weight_down.weight,
-                    module.block_inject_weight.weight,
-                ],
-                axis=0,
-            )
+            weight = mx.concatenate([linear.weight for linear in linears], axis=0)
             entry = (module_ref, weight)
             cache[key] = entry
 
         weight = entry[1]
         return mx.concatenate(
             [
-                normed[:, index : index + 1] @ weight.T
-                for index in range(normed.shape[1])
+                hidden_states[:, index : index + 1] @ weight.T
+                for index in range(hidden_states.shape[1])
             ],
             axis=1,
+        )
+
+    def _combined_hyper_projection(self, module, normed):
+        return self._combined_projection(
+            module,
+            normed,
+            (module.input_mix_weight_down, module.block_inject_weight),
+            "_combined_hyper_projection_cache",
         )
 
     def _hyper_connection(self, module, hidden_states):
@@ -1706,6 +1708,40 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         )
         injection = 2 * mx.sigmoid(injection_projection / module.hc_count)
         return mixed, hidden_states, injection
+
+    def _combined_moe_gate_projection(self, module, hidden_states):
+        return self._combined_projection(
+            module,
+            hidden_states,
+            (module.gate, module.shared_expert_gate),
+            "_combined_moe_gate_projection_cache",
+        )
+
+    def _feed_forward(self, feed_forward, hidden_states):
+        if not (
+            os.environ.get("MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION") == "1"
+            and hasattr(feed_forward, "switch_mlp")
+            and hidden_states.ndim == 3
+            and hidden_states.shape[1] > 1
+            and feed_forward.gate.weight.dtype == hidden_states.dtype
+            and feed_forward.shared_expert_gate.weight.dtype == hidden_states.dtype
+        ):
+            return super()._feed_forward(feed_forward, hidden_states)
+
+        projection = self._combined_moe_gate_projection(feed_forward, hidden_states)
+        split = feed_forward.gate.weight.shape[0]
+        gates = mx.softmax(projection[..., :split], axis=-1, precise=True)
+        top_k = feed_forward.top_k
+        indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
+        scores = mx.take_along_axis(gates, indices, axis=-1)
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+
+        output = self._switch_glu(feed_forward.switch_mlp, hidden_states, indices)
+        output = (output * scores[..., None]).sum(axis=-2)
+
+        shared_output = super()._feed_forward(feed_forward.shared_expert, hidden_states)
+        shared_gate = mx.sigmoid(projection[..., split:])
+        return output + shared_gate * shared_output
 
     @staticmethod
     def _inject(branch, hyper_input, injection_weights):

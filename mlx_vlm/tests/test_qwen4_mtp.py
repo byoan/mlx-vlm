@@ -10,6 +10,7 @@ import pytest
 from mlx.utils import tree_map
 
 from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from mlx_vlm.models.qwen4_exp import exact_sparse_qsa
 from mlx_vlm.models.qwen4_exp.config import TextConfig
 from mlx_vlm.models.qwen4_exp.exact_sparse_qsa import Qwen4ExactSparseSelection
@@ -208,6 +209,42 @@ def test_qwen4_combined_hyper_projection_is_exact_and_reused(width):
     del module
     gc.collect()
     assert module_id not in verifier._combined_hyper_projection_cache
+
+
+@pytest.mark.parametrize("width", [2, 3, 4, 8])
+def test_qwen4_combined_moe_gate_projection_is_exact_and_reused(width):
+    module = Qwen3_5MoeSparseMoeBlock(_tiny_text_config())
+    module.update(
+        tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
+    )
+    verifier = Qwen4ExpExactSpeculativeVerifier()
+    hidden = mx.random.normal(
+        shape=(1, width, module.gate.weight.shape[1]),
+        key=mx.random.key(31 + width),
+    ).astype(mx.bfloat16)
+
+    with patch.dict(os.environ, {}, clear=True):
+        expected = verifier._feed_forward(module, hidden)
+    with patch.dict(
+        os.environ,
+        {"MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION": "1"},
+        clear=True,
+    ):
+        actual = verifier._feed_forward(module, hidden)
+        module_id = id(module)
+        cache_entry = verifier._combined_moe_gate_projection_cache[module_id]
+        cached_weight = cache_entry[1]
+        repeated = verifier._feed_forward(module, hidden)
+
+    mx.eval(expected, actual, repeated)
+    assert cache_entry[0]() is module
+    assert verifier._combined_moe_gate_projection_cache[module_id][1] is cached_weight
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(repeated, expected).item()
+
+    del module
+    gc.collect()
+    assert module_id not in verifier._combined_moe_gate_projection_cache
 
 
 def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():
