@@ -282,6 +282,51 @@ def test_qwen4_combined_moe_gate_projection_is_exact_and_reused(width):
 
 
 @pytest.mark.parametrize("width", [2, 3, 4, 8])
+def test_qwen4_padded_moe_gate_kernel_is_exact_and_reused(width):
+    module = Qwen3_5MoeSparseMoeBlock(_tiny_text_config())
+    module.update(
+        tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
+    )
+    verifier = Qwen4ExpExactSpeculativeVerifier()
+    hidden = mx.random.normal(
+        shape=(1, width, module.gate.weight.shape[1]),
+        key=mx.random.key(37 + width),
+    ).astype(mx.bfloat16)
+
+    with patch.dict(os.environ, {}, clear=True):
+        expected = verifier._feed_forward(module, hidden)
+    with patch.dict(
+        os.environ,
+        {
+            "MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION": "1",
+            "MLX_VLM_QWEN4_PADDED_MOE_GATE_KERNEL": "1",
+        },
+        clear=True,
+    ):
+        actual = verifier._feed_forward(module, hidden)
+        module_id = id(module)
+        cache_entry = verifier._combined_moe_gate_padded_projection_cache[module_id]
+        cached_weight = cache_entry[1]
+        repeated = verifier._feed_forward(module, hidden)
+
+    mx.eval(expected, actual, repeated)
+    output_size = module.gate.weight.shape[0] + 1
+    assert cache_entry[0]() is module
+    assert cache_entry[2] == output_size
+    assert cached_weight.shape[0] == (output_size + 3) // 4 * 4
+    assert (
+        verifier._combined_moe_gate_padded_projection_cache[module_id][1]
+        is cached_weight
+    )
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(repeated, expected).item()
+
+    del module
+    gc.collect()
+    assert module_id not in verifier._combined_moe_gate_padded_projection_cache
+
+
+@pytest.mark.parametrize("width", [2, 3, 4, 8])
 def test_qwen4_combined_gdn_ab_projection_is_exact_and_reused(width):
     module = Qwen4ExpGatedDeltaNet(_tiny_text_config())
     module.update(
