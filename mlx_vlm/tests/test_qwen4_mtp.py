@@ -13,6 +13,7 @@ from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from mlx_vlm.models.qwen4_exp import exact_sparse_qsa
 from mlx_vlm.models.qwen4_exp.config import TextConfig
+from mlx_vlm.models.qwen4_exp.exact_moe_route import exact_moe_route
 from mlx_vlm.models.qwen4_exp.exact_sparse_qsa import Qwen4ExactSparseSelection
 from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
@@ -324,6 +325,46 @@ def test_qwen4_padded_moe_gate_kernel_is_exact_and_reused(width):
     del module
     gc.collect()
     assert module_id not in verifier._combined_moe_gate_padded_projection_cache
+
+
+@pytest.mark.parametrize("width", [2, 3, 4, 8])
+def test_qwen4_fused_moe_route_is_exact(width):
+    projection = mx.random.normal(
+        (1, width, 513), key=mx.random.key(43 + width)
+    ).astype(mx.bfloat16)
+    route = exact_moe_route(projection)
+    if route is None:
+        pytest.skip("exact Qwen4 MoE routing requires Metal")
+
+    gates = mx.softmax(projection[..., :512], axis=-1, precise=True)
+    indices = mx.argpartition(gates, kth=-10, axis=-1)[..., -10:]
+    scores = mx.take_along_axis(gates, indices, axis=-1)
+    scores = scores / scores.sum(axis=-1, keepdims=True)
+    shared_gate = mx.sigmoid(projection[..., 512:])
+    expected = (indices, scores, shared_gate)
+    mx.eval(*expected, *route)
+
+    for actual, reference in zip(route, expected):
+        assert mx.array_equal(actual, reference).item()
+
+
+def test_qwen4_fused_moe_route_preserves_cutoff_ties():
+    projection = mx.zeros((1, 3, 513), dtype=mx.bfloat16)
+    projection = projection.at[..., 100:120].add(mx.array(1, dtype=mx.bfloat16))
+    route = exact_moe_route(projection)
+    if route is None:
+        pytest.skip("exact Qwen4 MoE routing requires Metal")
+
+    indices, scores, shared_gate = route
+    mx.eval(indices, scores, shared_gate)
+    expected_indices = mx.broadcast_to(mx.arange(110, 120), (1, 3, 10))
+    gates = mx.softmax(projection[..., :512], axis=-1, precise=True)
+    expected_scores = mx.take_along_axis(gates, expected_indices, axis=-1)
+    expected_scores = expected_scores / expected_scores.sum(axis=-1, keepdims=True)
+    mx.eval(expected_scores)
+    assert mx.array_equal(indices, expected_indices).item()
+    assert mx.array_equal(scores, expected_scores).item()
+    assert mx.array_equal(shared_gate, mx.full_like(shared_gate, 0.5)).item()
 
 
 @pytest.mark.parametrize("width", [2, 3, 4, 8])
