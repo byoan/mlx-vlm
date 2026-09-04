@@ -1062,6 +1062,40 @@ def _sample_with_positions(
     return sampler(logprobs)
 
 
+def _tokenizer_output_size(tokenizer) -> Optional[int]:
+    """Return the highest decodable token ID plus one, when discoverable."""
+
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    vocab = get_vocab() if callable(get_vocab) else getattr(tokenizer, "vocab", None)
+    if not isinstance(vocab, dict) or not vocab:
+        return None
+    return max(int(token_id) for token_id in vocab.values()) + 1
+
+
+def _limit_sampler_vocab(sampler, vocab_size: Optional[int]):
+    """Hide padded model-output rows from all sampler entry points."""
+
+    if vocab_size is None:
+        return sampler
+
+    def trim(logprobs):
+        return logprobs[..., :vocab_size]
+
+    def wrapped(logprobs):
+        return sampler(trim(logprobs))
+
+    for method_name in ("sample_target", "sample_proposal"):
+        method = getattr(sampler, method_name, None)
+        if not callable(method):
+            continue
+
+        def positioned(logprobs, *, row_ids, positions, _method=method):
+            return _method(trim(logprobs), row_ids=row_ids, positions=positions)
+
+        setattr(wrapped, method_name, positioned)
+    return wrapped
+
+
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -2412,7 +2446,21 @@ class BatchGenerator:
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        tokenizer_output_size = _tokenizer_output_size(self.tokenizer)
+        self.sampler = _limit_sampler_vocab(
+            sampler or (lambda x: mx.argmax(x, axis=-1)), tokenizer_output_size
+        )
+        language_model = getattr(self.model, "language_model", self.model)
+        configure_target_vocab = getattr(
+            language_model, "configure_tokenizer_vocab_size", None
+        )
+        if callable(configure_target_vocab) and tokenizer_output_size is not None:
+            configure_target_vocab(tokenizer_output_size)
+        configure_vocab = getattr(
+            self.draft_model, "configure_tokenizer_vocab_size", None
+        )
+        if callable(configure_vocab) and tokenizer_output_size is not None:
+            configure_vocab(tokenizer_output_size)
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size

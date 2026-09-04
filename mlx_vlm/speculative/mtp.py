@@ -322,6 +322,8 @@ def _speculative_walk_batch_deferred_uniform(
     draft_tokens: mx.array,
     sampler: Callable[[mx.array], mx.array],
     budgets: List[int],
+    row_ids: Optional[List[int]] = None,
+    base_positions: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Deferred walk for models whose batched drafter cache needs lockstep rows.
 
@@ -342,7 +344,19 @@ def _speculative_walk_batch_deferred_uniform(
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            target_tokens = sampler(logprobs)
+            if _sampler_supports_positioned_target(sampler):
+                if row_ids is None or base_positions is None:
+                    raise ValueError(
+                        "positioned target sampling requires row_ids and "
+                        "base_positions."
+                    )
+                target_tokens = sampler.sample_target(
+                    logprobs,
+                    row_ids=row_ids,
+                    positions=[int(position) + pos for position in base_positions],
+                )
+            else:
+                target_tokens = sampler(logprobs)
         mx.eval(target_tokens)
         target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
 
@@ -964,6 +978,10 @@ def _mtp_rounds_batch(
                         draft_tokens,
                         sampler,
                         budgets,
+                        row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                        base_positions=[
+                            emitted[active_idx[j]] for j in range(n_active)
+                        ],
                     )
                 )
             else:
@@ -1046,7 +1064,10 @@ def _mtp_rounds_batch(
 
         # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
         # per-row tail-zero on rows that accepted less).
-        if any(a < bs - 1 for a in accepted_list):
+        requires_replay = bool(
+            n_active > 1 and getattr(lm, "requires_multirow_speculative_replay", False)
+        )
+        if requires_replay or any(a < bs - 1 for a in accepted_list):
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
                     prompt_cache, verify.gdn_states, accepted_list, bs
