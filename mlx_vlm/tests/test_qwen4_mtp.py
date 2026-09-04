@@ -692,7 +692,7 @@ def test_qwen4_multirow_speculative_verifier_avoids_long_cache_snapshot():
     ).item()
 
 
-def test_qwen4_multirow_verifier_materializes_cache_before_fixed_width_append():
+def test_qwen4_multirow_verifier_materializes_cache_and_runs_singleton_rows():
     from mlx_vlm.models.qwen4_exp import language as qwen4_language
 
     language = LanguageModel(_tiny_text_config(), _outer_config())
@@ -714,7 +714,7 @@ def test_qwen4_multirow_verifier_materializes_cache_before_fixed_width_append():
         return eval_cache(*args)
 
     def record_verify(*args, **kwargs):
-        events.append("verify")
+        events.append(("verify", args[1].shape[0]))
         return verify_model(*args, **kwargs)
 
     with (
@@ -723,7 +723,83 @@ def test_qwen4_multirow_verifier_materializes_cache_before_fixed_width_append():
     ):
         language.speculative_verify_hidden(verify, cache)
 
-    assert events[:2] == ["eval", "verify"]
+    assert events == ["eval", ("verify", 1), ("verify", 1)]
+
+
+def test_qwen4_multirow_replay_materializes_each_cache_append():
+    from mlx_vlm.models.qwen4_exp import language as qwen4_language
+
+    language = LanguageModel(_tiny_text_config(), _outer_config())
+    recurrent = ArraysCache(2)
+    recurrent.state = [mx.zeros((2, 1)), mx.zeros((2, 1))]
+    snapshot = (list(recurrent.state), None, 0, None, 0)
+
+    class TrimmableCache:
+        def __init__(self):
+            self.trimmed = []
+
+        def trim(self, amount):
+            self.trimmed.append(amount)
+
+    attention = TrimmableCache()
+    replay_calls = []
+    eval_calls = []
+
+    def replay(_self, inputs, **kwargs):
+        replay_calls.append(inputs.tolist())
+        return SimpleNamespace(hidden_states=[mx.array(inputs)])
+
+    with (
+        patch.object(LanguageModel, "__call__", new=replay),
+        patch.object(
+            qwen4_language.mx,
+            "eval",
+            side_effect=lambda *args: eval_calls.append(args),
+        ),
+    ):
+        language.rollback_speculative_cache(
+            [recurrent, attention],
+            (
+                "recurrent_replay",
+                [snapshot, None],
+                mx.array([[1, 2, 3, 4], [5, 6, 7, 8]]),
+            ),
+            accepted=[2, 2],
+            block_size=4,
+        )
+
+    assert attention.trimmed == [4]
+    assert replay_calls == [[[1], [5]], [[2], [6]], [[3], [7]]]
+    assert len(eval_calls) == 3
+
+
+def test_qwen4_multirow_replay_matches_tokenwise_cache_after_partial_acceptance():
+    language = LanguageModel(_tiny_text_config(), _outer_config())
+    prompt = mx.array([[1, 2, 3], [7, 8, 9]], dtype=mx.int32)
+    verify = mx.array([[4, 5, 6, 10], [11, 12, 13, 14]], dtype=mx.int32)
+
+    def make_cache():
+        return [
+            entry if isinstance(entry, ArraysCache) else BatchQSAKVCache([0, 0])
+            for entry in language.make_cache()
+        ]
+
+    actual = make_cache()
+    reference = make_cache()
+    language(prompt, cache=actual)
+    language(prompt, cache=reference)
+    _, _, rollback = language.speculative_verify_hidden(verify, actual)
+    language.rollback_speculative_cache(actual, rollback, accepted=[2, 2], block_size=4)
+    for index in range(3):
+        language(verify[:, index : index + 1], cache=reference, skip_logits=True)
+    mx.eval([entry.state for entry in actual], [entry.state for entry in reference])
+    _assert_cache_equal(actual, reference)
+
+    continuation = mx.array([[15], [16]], dtype=mx.int32)
+    logits = language(continuation, cache=actual).logits
+    expected = language(continuation, cache=reference).logits
+    mx.eval(logits, expected)
+    assert mx.array_equal(logits, expected).item()
 
 
 def test_qwen4_fused_greedy_mixes_captured_hyper_state_before_lm_head(monkeypatch):

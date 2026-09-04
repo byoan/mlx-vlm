@@ -1823,22 +1823,98 @@ class LanguageModel(Qwen3_5LanguageModel):
         position_ids = offsets[:, None] + mx.arange(length, dtype=mx.int64)[None]
         if self._position_ids is not None and self._position_ids.ndim == 3:
             position_ids = mx.broadcast_to(position_ids[None], (3, batch, length))
-        output = _QWEN4_EXACT_SPECULATIVE_VERIFIER(
-            self,
-            inputs,
-            cache=cache,
-            position_ids=position_ids,
-            skip_logits=sampler is None,
-        )
+        if batch > 1:
+            row_outputs = []
+            row_caches = [[] for _ in cache]
+            batch_offsets = []
+            for cache_entry in cache:
+                offsets = getattr(cache_entry, "offset", None)
+                if (
+                    isinstance(offsets, mx.array)
+                    and offsets.ndim > 0
+                    and offsets.size >= batch
+                ):
+                    batch_offsets.append(offsets[:batch])
+                else:
+                    batch_offsets.append(None)
+
+            for row in range(batch):
+                current_cache = []
+                for cache_entry in cache:
+                    if cache_entry is None:
+                        row_cache = None
+                    elif isinstance(cache_entry, BatchQSAKVCache):
+                        row_cache = cache_entry.extract(row)
+                    else:
+                        row_cache = _extract_row_cache(cache_entry, row)
+                    if isinstance(cache_entry, ArraysCache) and isinstance(
+                        row_cache, ArraysCache
+                    ):
+                        left_padding = cache_entry.left_padding
+                        if left_padding is not None:
+                            row_cache.left_padding = left_padding[row : row + 1]
+                        lengths = cache_entry.lengths
+                        if lengths is not None:
+                            row_cache.lengths = lengths[row : row + 1]
+                    current_cache.append(row_cache)
+
+                row_position_ids = (
+                    position_ids[row : row + 1]
+                    if position_ids.ndim == 2
+                    else position_ids[:, row : row + 1]
+                )
+                row_output = _QWEN4_EXACT_SPECULATIVE_VERIFIER(
+                    self,
+                    inputs[row : row + 1],
+                    cache=current_cache,
+                    position_ids=row_position_ids,
+                    skip_logits=sampler is None,
+                )
+                row_outputs.append(row_output)
+                for index, cache_entry in enumerate(current_cache):
+                    row_caches[index].append(cache_entry)
+
+            for index, entries in enumerate(row_caches):
+                if cache[index] is None or not hasattr(cache[index].__class__, "merge"):
+                    continue
+                merged = cache[index].__class__.merge(entries)
+                if isinstance(merged, ArraysCache):
+                    left_padding = [entry.left_padding for entry in entries]
+                    if all(value is not None for value in left_padding):
+                        merged.left_padding = mx.concatenate(left_padding)
+                    lengths = [entry.lengths for entry in entries]
+                    if all(value is not None for value in lengths):
+                        merged.lengths = mx.concatenate(lengths)
+                cache[index] = _restore_batch_padding_metadata(
+                    merged, batch_offsets[index], length
+                )
+
+            hidden = mx.concatenate(
+                [output.hidden_states[-1] for output in row_outputs], axis=0
+            )
+            logits = (
+                None
+                if sampler is None
+                else mx.concatenate([output.logits for output in row_outputs], axis=0)
+            )
+        else:
+            output = _QWEN4_EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                position_ids=position_ids,
+                skip_logits=sampler is None,
+            )
+            hidden = output.hidden_states[-1]
+            logits = output.logits
         rollback_state = (
             ("recurrent_replay", recurrent_snapshot, inputs)
             if recurrent_snapshot is not None
             else output.gdn_states
         )
-        hidden = output.hidden_states[-1]
         if sampler is None:
             return hidden, {}, rollback_state
-        return hidden, {}, rollback_state, sampler(output.logits)
+        return hidden, {}, rollback_state, sampler(logits)
 
     def speculative_verify_hidden(self, inputs: mx.array, cache):
         return self._speculative_verify(inputs, cache)
@@ -1878,11 +1954,17 @@ class LanguageModel(Qwen3_5LanguageModel):
                 if not isinstance(cache, ArraysCache):
                     cache.trim(block_size)
             for index in range(keep):
-                self(
+                replay_output = self(
                     verify_inputs[:, index : index + 1],
                     cache=caches,
                     skip_logits=True,
+                    return_hidden=True,
                 )
+                # Batch KV caches append into preallocated buffers in place.
+                # Materialize each token's output so its cache writes complete
+                # before either another replay append or the next verifier
+                # round targets the same storage.
+                mx.eval(replay_output.hidden_states[-1])
             return accepted_list[0]
         if isinstance(rollback_state, tuple):
             snapshots, verify_inputs = rollback_state
