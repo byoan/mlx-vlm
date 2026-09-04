@@ -110,6 +110,12 @@ the singleton evaluation order used by exact verification while sharing the
 input read across both BF16 projections. The combined weights use about 0.6 GB
 for the 48-layer checkpoint and are held only for the lifetime of the model.
 
+The MoE router and shared-expert gate can similarly share their BF16 input
+projection by setting `MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION=1`. This
+adds about 0.13 GB for the 48-layer checkpoint. Both combined-projection flags
+only affect multi-token exact verification and retain the normal fallback for
+other dtypes and shapes.
+
 ## Optional quantization
 
 The official BF16 checkpoint is approximately 360 GB. Depending on the
