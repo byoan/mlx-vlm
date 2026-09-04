@@ -35,6 +35,7 @@ from .qsa_kernel import (
     qsa_sparse_attention,
     select_qsa_execution_plan,
 )
+from .exact_moe_route import exact_moe_route
 from .exact_sparse_qsa import Qwen4ExactSparseSelection
 from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
 from .exact_sparse_qsa import select_blocks as select_exact_sparse_qsa_blocks
@@ -1952,17 +1953,25 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
 
         projection = self._combined_moe_gate_projection(feed_forward, hidden_states)
         split = feed_forward.gate.weight.shape[0]
-        gates = mx.softmax(projection[..., :split], axis=-1, precise=True)
-        top_k = feed_forward.top_k
-        indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
-        scores = mx.take_along_axis(gates, indices, axis=-1)
-        scores = scores / scores.sum(axis=-1, keepdims=True)
+        route = (
+            exact_moe_route(projection)
+            if os.environ.get("MLX_VLM_QWEN4_FUSED_MOE_ROUTE") == "1"
+            else None
+        )
+        if route is None:
+            gates = mx.softmax(projection[..., :split], axis=-1, precise=True)
+            top_k = feed_forward.top_k
+            indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
+            scores = mx.take_along_axis(gates, indices, axis=-1)
+            scores = scores / scores.sum(axis=-1, keepdims=True)
+            shared_gate = mx.sigmoid(projection[..., split:])
+        else:
+            indices, scores, shared_gate = route
 
         output = self._switch_glu(feed_forward.switch_mlp, hidden_states, indices)
         output = (output * scores[..., None]).sum(axis=-2)
 
         shared_output = super()._feed_forward(feed_forward.shared_expert, hidden_states)
-        shared_gate = mx.sigmoid(projection[..., split:])
         return output + shared_gate * shared_output
 
     def _gated_delta_projections(self, layer, hidden_states):

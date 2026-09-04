@@ -129,6 +129,15 @@ requires `MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION=1`, preserves the
 singleton accumulation and rounding order, and falls back for unsupported
 dtypes or shapes.
 
+The checkpoint's precise softmax, stable top-10 selection, BF16 score
+renormalization, and shared-gate sigmoid can then be fused into one Metal
+dispatch with `MLX_VLM_QWEN4_FUSED_MOE_ROUTE=1`. This requires both combined
+MoE projection flags above and only applies to the checkpoint's 512-expert,
+top-10, BF16 verifier layout. Unsupported layouts retain the standard path.
+The split projection/tail organization was informed by
+[MTPLX PR #391](https://github.com/youssofal/MTPLX/pull/391); the mlx-vlm
+kernel supports its dynamic verification widths and MXFP8 checkpoint.
+
 Finally, the two 48-value gated-delta control projections can share a 96-row
 BF16 projection by setting `MLX_VLM_QWEN4_COMBINED_GDN_AB_PROJECTION=1`. This
 adds about 18 MB for the checkpoint's 36 gated-delta layers and leaves the
