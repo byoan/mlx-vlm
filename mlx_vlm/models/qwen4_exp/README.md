@@ -97,6 +97,13 @@ The released checkpoint contains one MTP layer, so the default draft block is
 one speculative token. `--draft-block-size` can chain the head for additional
 draft tokens; the best value depends on the prompt and hardware.
 
+On Apple M3 Ultra, long-context QSA verification can use an exact sparse
+attention kernel by setting `MLX_VLM_QWEN4_EXACT_SPARSE_QSA=1`. The kernel is
+limited to the checkpoint's 24 query heads, 2 KV heads, and 256-wide BF16/FP16
+attention layout. It preserves MLX's 1,024-partition accumulation order and
+falls back to the regular attention path for unsupported shapes, devices,
+cache layouts, or `MLX_SDPA_BLOCKS` overrides.
+
 ## Optional quantization
 
 The official BF16 checkpoint is approximately 360 GB. Depending on the

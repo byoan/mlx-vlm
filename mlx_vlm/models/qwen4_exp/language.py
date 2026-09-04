@@ -32,6 +32,8 @@ from .qsa_kernel import (
     qsa_sparse_attention,
     select_qsa_execution_plan,
 )
+from .exact_sparse_qsa import Qwen4ExactSparseSelection
+from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
 
 
 def _append_indexer_positions(
@@ -933,8 +935,27 @@ class Qwen4ExpQSAIndexer(nn.Module):
         qk: mx.array,
         cache: Optional[QSAKVCache],
         position_ids: Optional[mx.array],
+        *,
+        return_selection: bool = False,
     ) -> Optional[mx.array]:
         selection = self.select_from_projected(qk, cache, position_ids)
+        if (
+            return_selection
+            and selection is not None
+            and exact_sparse_qsa_enabled()
+            and selection.zero_padding
+            and selection.selected_blocks.shape[0] == 1
+            and cache is not None
+            and not hasattr(cache, "bits")
+            and selection.key_len >= 65_536
+        ):
+            return Qwen4ExactSparseSelection(
+                selection.selected_blocks,
+                selection.complete_counts,
+                selection.query_ends[0],
+                selection.key_len,
+                self.compress_ratio,
+            )
         return None if selection is None else self.build_mask(selection)
 
     def select_from_projected(
@@ -1863,7 +1884,14 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
 
     def _qsa_mask(self, attention, hidden_states, cache, position_ids, mask):
         projected = self._linear(attention.indexer.index_qk_proj, hidden_states)
-        qsa_mask = attention.indexer.from_projected(projected, cache, position_ids)
+        qsa_mask = attention.indexer.from_projected(
+            projected,
+            cache,
+            position_ids,
+            return_selection=True,
+        )
+        if isinstance(qsa_mask, Qwen4ExactSparseSelection):
+            return qsa_mask
         if qsa_mask is None:
             return mask
         if mask is None or (isinstance(mask, str) and mask == "causal"):
