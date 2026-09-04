@@ -1375,13 +1375,16 @@ class Qwen3_5ExactSpeculativeVerifier:
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
         return q, k
 
-    def _gated_delta(self, layer, inputs, mask, cache, gdn_sink):
-        helpers = self._helpers()
-        batch, length, _ = inputs.shape
-        mixed_qkv, z, b, a = self._linears(
+    def _gated_delta_projections(self, layer, inputs):
+        return self._linears(
             (layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a),
             inputs,
         )
+
+    def _gated_delta(self, layer, inputs, mask, cache, gdn_sink):
+        helpers = self._helpers()
+        batch, length, _ = inputs.shape
+        mixed_qkv, z, b, a = self._gated_delta_projections(layer, inputs)
         z = z.reshape(batch, length, -1, layer.head_v_dim)
 
         if cache is not None and cache[0] is not None:

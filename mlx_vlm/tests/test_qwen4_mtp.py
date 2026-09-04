@@ -19,6 +19,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     LanguageModel,
     Qwen4ExpDecoderLayer,
     Qwen4ExpExactSpeculativeVerifier,
+    Qwen4ExpGatedDeltaNet,
     Qwen4ExpGatedResidual,
 )
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
@@ -245,6 +246,43 @@ def test_qwen4_combined_moe_gate_projection_is_exact_and_reused(width):
     del module
     gc.collect()
     assert module_id not in verifier._combined_moe_gate_projection_cache
+
+
+@pytest.mark.parametrize("width", [2, 3, 4, 8])
+def test_qwen4_combined_gdn_ab_projection_is_exact_and_reused(width):
+    module = Qwen4ExpGatedDeltaNet(_tiny_text_config())
+    module.update(
+        tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
+    )
+    verifier = Qwen4ExpExactSpeculativeVerifier()
+    hidden = mx.random.normal(
+        shape=(1, width, module.in_proj_a.weight.shape[1]),
+        key=mx.random.key(41 + width),
+    ).astype(mx.bfloat16)
+
+    with patch.dict(os.environ, {}, clear=True):
+        expected = verifier._gated_delta_projections(module, hidden)
+    with patch.dict(
+        os.environ,
+        {"MLX_VLM_QWEN4_COMBINED_GDN_AB_PROJECTION": "1"},
+        clear=True,
+    ):
+        actual = verifier._gated_delta_projections(module, hidden)
+        module_id = id(module)
+        cache_entry = verifier._combined_gdn_ab_projection_cache[module_id]
+        cached_weight = cache_entry[1]
+        repeated = verifier._gated_delta_projections(module, hidden)
+
+    mx.eval(*expected, *actual, *repeated)
+    assert cache_entry[0]() is module
+    assert verifier._combined_gdn_ab_projection_cache[module_id][1] is cached_weight
+    for reference, combined, reused in zip(expected, actual, repeated):
+        assert mx.array_equal(combined, reference).item()
+        assert mx.array_equal(reused, reference).item()
+
+    del module
+    gc.collect()
+    assert module_id not in verifier._combined_gdn_ab_projection_cache
 
 
 def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():

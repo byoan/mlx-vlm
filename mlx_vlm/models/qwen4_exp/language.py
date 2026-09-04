@@ -1743,6 +1743,27 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         shared_gate = mx.sigmoid(projection[..., split:])
         return output + shared_gate * shared_output
 
+    def _gated_delta_projections(self, layer, hidden_states):
+        if not (
+            os.environ.get("MLX_VLM_QWEN4_COMBINED_GDN_AB_PROJECTION") == "1"
+            and hidden_states.ndim == 3
+            and hidden_states.shape[1] > 1
+            and layer.in_proj_a.weight.dtype == hidden_states.dtype
+            and layer.in_proj_b.weight.dtype == hidden_states.dtype
+        ):
+            return super()._gated_delta_projections(layer, hidden_states)
+
+        mixed_qkv = self._linear(layer.in_proj_qkv, hidden_states)
+        z = self._linear(layer.in_proj_z, hidden_states)
+        projection = self._combined_projection(
+            layer,
+            hidden_states,
+            (layer.in_proj_b, layer.in_proj_a),
+            "_combined_gdn_ab_projection_cache",
+        )
+        split = layer.in_proj_b.weight.shape[0]
+        return mixed_qkv, z, projection[..., :split], projection[..., split:]
+
     @staticmethod
     def _inject(branch, hyper_input, injection_weights):
         injection = branch[..., None, :] * injection_weights[..., None]
