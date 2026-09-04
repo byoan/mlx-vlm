@@ -50,6 +50,32 @@ def _append_indexer_positions(
     return mx.concatenate([cached, position_ids], axis=-1)
 
 
+def _qsa_preallocated_append(cached, values, previous, axis, step=256):
+    """Append into a stepped buffer and return its logical prefix."""
+
+    length = values.shape[axis]
+    required = previous + length
+    if cached is None or required > cached.shape[axis]:
+        added = ((length + step - 1) // step) * step
+        shape = list(values.shape)
+        shape[axis] = added
+        extension = mx.zeros(shape, dtype=values.dtype)
+        if cached is None:
+            cached = extension
+        else:
+            if previous < cached.shape[axis]:
+                prefix = [slice(None)] * cached.ndim
+                prefix[axis] = slice(0, previous)
+                cached = cached[tuple(prefix)]
+            cached = mx.concatenate([cached, extension], axis=axis)
+    target = [slice(None)] * cached.ndim
+    target[axis] = slice(previous, required)
+    cached[tuple(target)] = values
+    visible = [slice(None)] * cached.ndim
+    visible[axis] = slice(0, required)
+    return cached, cached[tuple(visible)]
+
+
 class QSAKVCache(KVCache):
     """KV cache with the raw indexer keys and multimodal positions used by QSA."""
 
@@ -64,8 +90,34 @@ class QSAKVCache(KVCache):
         self.index_position_ids = None
         self._qsa_pooled_keys = None
         self._qsa_pooled_ratio = None
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
+        if os.environ.get("MLX_VLM_QWEN4_PREALLOCATED_INDEX_CACHE") == "1" and (
+            self.index_position_ids is None
+            or self.index_position_ids.ndim == position_ids.ndim
+        ):
+            previous = 0 if self.index_keys is None else self.index_keys.shape[1]
+            keys_buffer = self._index_keys_buffer
+            if keys_buffer is None and self.index_keys is not None:
+                keys_buffer = self.index_keys
+            positions_buffer = self._index_position_ids_buffer
+            if positions_buffer is None and self.index_position_ids is not None:
+                positions_buffer = self.index_position_ids
+            self._index_keys_buffer, self.index_keys = _qsa_preallocated_append(
+                keys_buffer, keys, previous, 1
+            )
+            (
+                self._index_position_ids_buffer,
+                self.index_position_ids,
+            ) = _qsa_preallocated_append(
+                positions_buffer,
+                position_ids,
+                previous,
+                position_ids.ndim - 1,
+            )
+            return self.index_keys, self.index_position_ids
         if self.index_keys is None:
             self.index_keys = keys
             self.index_position_ids = position_ids
@@ -74,6 +126,8 @@ class QSAKVCache(KVCache):
             self.index_position_ids = _append_indexer_positions(
                 self.index_position_ids, position_ids
             )
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
         return self.index_keys, self.index_position_ids
 
     @property
@@ -91,6 +145,8 @@ class QSAKVCache(KVCache):
     def state(self, value):
         self.keys, self.values, self.index_keys, self.index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
         self._trim_qsa_pool(self.offset)
 
     def trim(self, n):
@@ -138,6 +194,8 @@ class QSAKVCache(KVCache):
                 self.index_position_ids = self.index_position_ids[:, batch_indices]
             else:
                 self.index_position_ids = self.index_position_ids[batch_indices]
+            self._index_keys_buffer = None
+            self._index_position_ids_buffer = None
 
     def to_batch(self, left_padding):
         """Convert a singleton QSA cache, including its indexer state."""
@@ -218,6 +276,8 @@ class BatchQSAKVCache:
         self.index_offset = 0
         self._qsa_pooled_keys = None
         self._qsa_pooled_ratio = None
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
 
     @property
     def offset(self):
@@ -243,6 +303,34 @@ class BatchQSAKVCache:
         return self.kv_cache.update_and_fetch(keys, values)
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
+        if (
+            os.environ.get("MLX_VLM_QWEN4_PREALLOCATED_INDEX_CACHE") == "1"
+            and keys.shape[0] == 1
+            and (
+                self.index_position_ids is None
+                or self.index_position_ids.ndim == position_ids.ndim
+            )
+        ):
+            keys_buffer = self._index_keys_buffer
+            if keys_buffer is None and self.index_keys is not None:
+                keys_buffer = self.index_keys
+            positions_buffer = self._index_position_ids_buffer
+            if positions_buffer is None and self.index_position_ids is not None:
+                positions_buffer = self.index_position_ids
+            self._index_keys_buffer, self.index_keys = _qsa_preallocated_append(
+                keys_buffer, keys, self.index_offset, 1
+            )
+            (
+                self._index_position_ids_buffer,
+                self.index_position_ids,
+            ) = _qsa_preallocated_append(
+                positions_buffer,
+                position_ids,
+                self.index_offset,
+                position_ids.ndim - 1,
+            )
+            self.index_offset += keys.shape[1]
+            return self.index_keys, self.index_position_ids
         if self.index_keys is None:
             self.index_keys = keys
             self.index_position_ids = position_ids
@@ -254,6 +342,8 @@ class BatchQSAKVCache:
                 self.index_position_ids[..., : self.index_offset], position_ids
             )
         self.index_offset = self.index_keys.shape[1]
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
         return self.index_keys, self.index_position_ids
 
     def prepare(self, **kwargs):
@@ -273,6 +363,8 @@ class BatchQSAKVCache:
             self.index_position_ids = dynamic_roll(
                 self.index_position_ids, right_padding, axis=1
             )
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
 
     def make_mask(self, *args, **kwargs):
         return self.kv_cache.make_mask(*args, **kwargs)
@@ -291,6 +383,8 @@ class BatchQSAKVCache:
             self.index_keys = self.index_keys[:, min_left:]
             self.index_position_ids = self.index_position_ids[..., min_left:]
             self.index_offset -= min_left
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
 
     @staticmethod
     def _promote_positions(positions, sample_positions):
@@ -370,6 +464,8 @@ class BatchQSAKVCache:
                 [left[1], right[1]], axis=position_axis
             )
             self.index_offset = target
+            self._index_keys_buffer = None
+            self._index_position_ids_buffer = None
 
     def extract(self, idx):
         cache = QSAKVCache()
@@ -449,6 +545,9 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        if self.index_keys is not None:
+            self.index_keys = self.index_keys[:, : self.index_offset]
+            self.index_position_ids = self.index_position_ids[..., : self.index_offset]
         pooled = getattr(self, "_qsa_pooled_keys", None)
         ratio = getattr(self, "_qsa_pooled_ratio", None)
         if pooled is not None and ratio is not None:
@@ -492,6 +591,8 @@ class BatchQSAKVCache:
         else:
             self.kv_cache.state = kv_state
         self.index_offset = 0 if self.index_keys is None else self.index_keys.shape[1]
+        self._index_keys_buffer = None
+        self._index_position_ids_buffer = None
         pooled = getattr(self, "_qsa_pooled_keys", None)
         ratio = getattr(self, "_qsa_pooled_ratio", None)
         if pooled is not None and ratio is not None:

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -408,6 +409,39 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertIsInstance(quantized, QSAQuantizedKVCache)
         self.assertEqual(quantized.index_keys.shape, (1, 12, 8))
         self.assertEqual(quantized.offset, 12)
+
+    def test_preallocated_qsa_index_cache_exposes_only_logical_prefix(self):
+        with patch.dict("os.environ", {"MLX_VLM_QWEN4_PREALLOCATED_INDEX_CACHE": "1"}):
+            cache = QSAKVCache()
+            cache.update_and_fetch(mx.zeros((1, 2, 3, 32)), mx.zeros((1, 2, 3, 32)))
+            cache.update_indexer(
+                mx.arange(24).reshape(1, 3, 8),
+                mx.arange(3, dtype=mx.int32)[None],
+            )
+            cache.update_and_fetch(mx.zeros((1, 2, 2, 32)), mx.zeros((1, 2, 2, 32)))
+            cache.update_indexer(
+                mx.arange(16).reshape(1, 2, 8) + 24,
+                mx.arange(3, 5, dtype=mx.int32)[None],
+            )
+
+            self.assertEqual(cache.index_keys.shape, (1, 5, 8))
+            self.assertEqual(cache.index_position_ids.shape, (1, 5))
+            self.assertEqual(cache._index_keys_buffer.shape, (1, 256, 8))
+            self.assertEqual(cache.state[2].shape, (1, 5, 8))
+
+            cache.trim(2)
+            cache.update_and_fetch(mx.zeros((1, 2, 1, 32)), mx.zeros((1, 2, 1, 32)))
+            cache.update_indexer(
+                mx.full((1, 1, 8), 99), mx.array([[3]], dtype=mx.int32)
+            )
+            mx.eval(cache.index_keys, cache.index_position_ids)
+
+            self.assertEqual(cache.index_keys.shape, (1, 4, 8))
+            self.assertTrue(mx.all(cache.index_keys[:, -1] == 99).item())
+            self.assertEqual(cache.index_position_ids.tolist(), [[0, 1, 2, 3]])
+
+            quantized = cache.to_quantized(group_size=32, bits=8)
+            self.assertEqual(quantized.index_keys.shape, (1, 4, 8))
 
     def test_qsa_cache_merges_ragged_rows_and_round_trips_extract(self):
         rows = []
