@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_map
 
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen4_exp import exact_sparse_qsa
@@ -15,6 +17,8 @@ from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     LanguageModel,
     Qwen4ExpDecoderLayer,
+    Qwen4ExpExactSpeculativeVerifier,
+    Qwen4ExpGatedResidual,
 )
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
@@ -167,6 +171,43 @@ def test_qwen4_exact_sparse_qsa_matches_m3_ultra_sdpa_with_cache_capacity():
         mx.eval(actual, expected)
 
     assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("width", [2, 3, 4, 8])
+def test_qwen4_combined_hyper_projection_is_exact_and_reused(width):
+    module = Qwen4ExpGatedResidual(_tiny_text_config())
+    module.update(
+        tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
+    )
+    verifier = Qwen4ExpExactSpeculativeVerifier()
+    hidden = mx.random.normal(
+        shape=(1, width, module.hc_count * module.hidden_size),
+        key=mx.random.key(23 + width),
+    ).astype(mx.bfloat16)
+
+    with patch.dict(os.environ, {}, clear=True):
+        expected = verifier._hyper_connection(module, hidden)
+    with patch.dict(
+        os.environ,
+        {"MLX_VLM_QWEN4_COMBINED_HYPER_PROJECTION": "1"},
+        clear=True,
+    ):
+        actual = verifier._hyper_connection(module, hidden)
+        module_id = id(module)
+        cache_entry = verifier._combined_hyper_projection_cache[module_id]
+        cached_weight = cache_entry[1]
+        repeated = verifier._hyper_connection(module, hidden)
+
+    mx.eval(*expected, *actual, *repeated)
+    assert cache_entry[0]() is module
+    assert verifier._combined_hyper_projection_cache[id(module)][1] is cached_weight
+    for reference, combined, reused in zip(expected, actual, repeated):
+        assert mx.array_equal(combined, reference).item()
+        assert mx.array_equal(reused, reference).item()
+
+    del module
+    gc.collect()
+    assert module_id not in verifier._combined_hyper_projection_cache
 
 
 def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():

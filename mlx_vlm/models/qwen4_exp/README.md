@@ -104,6 +104,12 @@ attention layout. It preserves MLX's 1,024-partition accumulation order and
 falls back to the regular attention path for unsupported shapes, devices,
 cache layouts, or `MLX_SDPA_BLOCKS` overrides.
 
+Verification can also combine the hyper-connection mix and injection
+projections by setting `MLX_VLM_QWEN4_COMBINED_HYPER_PROJECTION=1`. This keeps
+the singleton evaluation order used by exact verification while sharing the
+input read across both BF16 projections. The combined weights use about 0.6 GB
+for the 48-layer checkpoint and are held only for the lifetime of the model.
+
 ## Optional quantization
 
 The official BF16 checkpoint is approximately 360 GB. Depending on the
