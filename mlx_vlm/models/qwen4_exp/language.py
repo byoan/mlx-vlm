@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import weakref
 from bisect import bisect_right
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -1638,11 +1639,58 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
     def _normalize_gated_delta_qk(layer, q, k):
         return layer._normalize_qk(q, k)
 
+    def _combined_hyper_projection(self, module, normed):
+        cache = getattr(self, "_combined_hyper_projection_cache", None)
+        if cache is None:
+            cache = {}
+            self._combined_hyper_projection_cache = cache
+
+        key = id(module)
+        entry = cache.get(key)
+        if entry is None or entry[0]() is not module:
+
+            def discard(module_ref, *, cache=cache, key=key):
+                current = cache.get(key)
+                if current is not None and current[0] is module_ref:
+                    cache.pop(key, None)
+
+            module_ref = weakref.ref(module, discard)
+            weight = mx.concatenate(
+                [
+                    module.input_mix_weight_down.weight,
+                    module.block_inject_weight.weight,
+                ],
+                axis=0,
+            )
+            entry = (module_ref, weight)
+            cache[key] = entry
+
+        weight = entry[1]
+        return mx.concatenate(
+            [
+                normed[:, index : index + 1] @ weight.T
+                for index in range(normed.shape[1])
+            ],
+            axis=1,
+        )
+
     def _hyper_connection(self, module, hidden_states):
         normed = module.hc_norm(hidden_states)
-        mix = nn.silu(
-            self._linear(module.input_mix_weight_down, normed) / module.hc_count
-        )
+        combined_projection = None
+        if (
+            os.environ.get("MLX_VLM_QWEN4_COMBINED_HYPER_PROJECTION") == "1"
+            and "block_inject_weight" in module
+            and hidden_states.ndim == 3
+            and hidden_states.shape[1] > 1
+            and module.input_mix_weight_down.weight.dtype == normed.dtype
+            and module.block_inject_weight.weight.dtype == normed.dtype
+        ):
+            combined_projection = self._combined_hyper_projection(module, normed)
+            split = module.input_mix_weight_down.weight.shape[0]
+            mix_projection = combined_projection[..., :split]
+        else:
+            mix_projection = self._linear(module.input_mix_weight_down, normed)
+        mix = nn.silu(mix_projection / module.hc_count)
         mix = mx.sigmoid(self._linear(module.input_mix_weight_up, mix))
         mix = mix.reshape(*mix.shape[:-1], module.hc_count, module.hidden_size)
         streams = normed.reshape(
@@ -1651,9 +1699,12 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         mixed = mx.mean(mix * streams, axis=-2)
         if "block_inject_weight" not in module:
             return mixed
-        injection = 2 * mx.sigmoid(
-            self._linear(module.block_inject_weight, normed) / module.hc_count
+        injection_projection = (
+            combined_projection[..., split:]
+            if combined_projection is not None
+            else self._linear(module.block_inject_weight, normed)
         )
+        injection = 2 * mx.sigmoid(injection_projection / module.hc_count)
         return mixed, hidden_states, injection
 
     @staticmethod
