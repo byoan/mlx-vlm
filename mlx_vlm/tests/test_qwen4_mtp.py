@@ -1,4 +1,5 @@
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,7 +8,9 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.models.qwen4_exp import exact_sparse_qsa
 from mlx_vlm.models.qwen4_exp.config import TextConfig
+from mlx_vlm.models.qwen4_exp.exact_sparse_qsa import Qwen4ExactSparseSelection
 from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     LanguageModel,
@@ -70,6 +73,100 @@ def _outer_config():
         video_token_id=61,
         vision_start_token_id=59,
     )
+
+
+def test_qwen4_exact_sparse_selection_preserves_selected_blocks_and_tail():
+    selection = Qwen4ExactSparseSelection(
+        selected_blocks=mx.array([[[0, 2], [1, 3]]], dtype=mx.int32),
+        complete_counts=mx.array([[3, 4]], dtype=mx.int32),
+        query_ends=mx.array([14, 17], dtype=mx.int32),
+        key_length=20,
+        block_size=4,
+    )
+
+    expected = [
+        [0, 1, 2, 3, 8, 9, 10, 11, 12, 13],
+        [4, 5, 6, 7, 12, 13, 14, 15, 16],
+    ]
+    dense = selection.dense_mask()
+    mx.eval(dense)
+    for query_index, expected_positions in enumerate(expected):
+        positions, offsets = exact_sparse_qsa._selected_positions(
+            selection, query_index
+        )
+        mx.eval(positions, offsets)
+        valid_positions = positions[: int(offsets[-1].item())].tolist()
+
+        assert valid_positions == expected_positions
+        dense_positions = [
+            index
+            for index, selected in enumerate(dense[0, 0, query_index].tolist())
+            if selected
+        ]
+        assert dense_positions == expected_positions
+
+
+def test_qwen4_exact_sparse_qsa_gate_is_explicit_and_partition_safe():
+    with patch.object(exact_sparse_qsa, "_is_m3_ultra", return_value=True):
+        with patch.dict(os.environ, {}, clear=True):
+            assert not exact_sparse_qsa.enabled()
+        with patch.dict(
+            os.environ,
+            {"MLX_VLM_QWEN4_EXACT_SPARSE_QSA": "1", "MLX_SDPA_BLOCKS": "512"},
+            clear=True,
+        ):
+            assert not exact_sparse_qsa.enabled()
+        with patch.dict(
+            os.environ,
+            {"MLX_VLM_QWEN4_EXACT_SPARSE_QSA": "1", "MLX_SDPA_BLOCKS": "1024"},
+            clear=True,
+        ):
+            assert exact_sparse_qsa.enabled()
+
+
+def test_qwen4_exact_sparse_qsa_matches_m3_ultra_sdpa_with_cache_capacity():
+    if (
+        not mx.metal.is_available()
+        or mx.device_info().get("device_name") != "Apple M3 Ultra"
+    ):
+        pytest.skip("exact 1,024-partition kernel is specific to Apple M3 Ultra")
+
+    key_length = 65_536
+    capacity = key_length + 256
+    queries = mx.random.normal(shape=(1, 24, 1, 256), key=mx.random.key(13)).astype(
+        mx.bfloat16
+    )
+    backing_keys = mx.random.normal(
+        shape=(1, 2, capacity, 256), key=mx.random.key(14)
+    ).astype(mx.bfloat16)
+    backing_values = mx.random.normal(
+        shape=(1, 2, capacity, 256), key=mx.random.key(15)
+    ).astype(mx.bfloat16)
+    keys = backing_keys[:, :, :key_length]
+    values = backing_values[:, :, :key_length]
+    scores = mx.random.normal(shape=(key_length // 4,), key=mx.random.key(16))
+    blocks = mx.argpartition(scores, kth=-512)[-512:].astype(mx.int32)
+    selection = Qwen4ExactSparseSelection(
+        selected_blocks=blocks.reshape(1, 1, -1),
+        complete_counts=mx.array([[key_length // 4]], dtype=mx.int32),
+        query_ends=mx.array([key_length], dtype=mx.int32),
+        key_length=key_length,
+        block_size=4,
+    )
+    cache = SimpleNamespace(keys=backing_keys, values=backing_values)
+
+    with patch.dict(os.environ, {"MLX_SDPA_BLOCKS": "1024"}):
+        actual = selection.apply(queries, keys, values, 256**-0.5, cache)
+        expected = mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=256**-0.5,
+            mask=selection.dense_mask(),
+        )
+        mx.eval(actual, expected)
+
+    assert mx.array_equal(actual, expected).item()
 
 
 def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():

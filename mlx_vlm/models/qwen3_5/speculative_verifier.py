@@ -1255,14 +1255,22 @@ class Qwen3_5ExactSpeculativeVerifier:
             mask,
         )
 
+        sparse_selection = getattr(mask, "apply", None)
+        output = (
+            sparse_selection(queries, keys, values, attention.scale, cache)
+            if sparse_selection is not None
+            else None
+        )
+        if sparse_selection is not None and output is None:
+            mask = mask.dense_mask()
+
         left_padded_decode = (
             mask == "left_padded_decode" if isinstance(mask, str) else False
         )
         if left_padded_decode:
             mask = None
 
-        output = None
-        if length > 1 or left_padded_decode:
+        if output is None and (length > 1 or left_padded_decode):
             output = self._helpers()._qwen3_5_left_padded_attention(
                 queries,
                 keys,

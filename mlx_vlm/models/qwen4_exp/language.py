@@ -28,6 +28,8 @@ from ..qwen3_5.language import (
 from ..qwen3_5.speculative_verifier import Qwen3_5ExactSpeculativeVerifier
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
+from .exact_sparse_qsa import Qwen4ExactSparseSelection
+from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
 
 
 def _append_indexer_positions(
@@ -814,6 +816,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
         qk: mx.array,
         cache: Optional[QSAKVCache],
         position_ids: Optional[mx.array],
+        *,
+        return_selection: bool = False,
     ) -> Optional[mx.array]:
         batch, seq_len, _ = qk.shape
         past_len = cache.offset if cache is not None else 0
@@ -972,6 +976,23 @@ class Qwen4ExpQSAIndexer(nn.Module):
         selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
             ..., -self.block_topk :
         ]
+
+        if (
+            return_selection
+            and exact_sparse_qsa_enabled()
+            and batch == 1
+            and zero_padding
+            and cache is not None
+            and not hasattr(cache, "bits")
+            and key_len >= 65_536
+        ):
+            return Qwen4ExactSparseSelection(
+                selected_blocks,
+                complete_counts,
+                query_ends,
+                key_len,
+                self.compress_ratio,
+            )
 
         # Scatter the winning blocks directly onto the token axis. Comparing
         # every token against every pick would cost seq_len * key_len *
@@ -1668,7 +1689,14 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
 
     def _qsa_mask(self, attention, hidden_states, cache, position_ids, mask):
         projected = self._linear(attention.indexer.index_qk_proj, hidden_states)
-        qsa_mask = attention.indexer.from_projected(projected, cache, position_ids)
+        qsa_mask = attention.indexer.from_projected(
+            projected,
+            cache,
+            position_ids,
+            return_selection=True,
+        )
+        if isinstance(qsa_mask, Qwen4ExactSparseSelection):
+            return qsa_mask
         if qsa_mask is None:
             return mask
         if mask is None or (isinstance(mask, str) and mask == "causal"):
