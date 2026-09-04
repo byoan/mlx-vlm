@@ -30,6 +30,7 @@ from ..qwen3_5.language import (
 from ..qwen3_5.speculative_verifier import Qwen3_5ExactSpeculativeVerifier
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
+from .exact_moe_combine import exact_moe_combine
 from .exact_moe_route import exact_moe_route
 from .exact_sparse_qsa import Qwen4ExactSparseSelection
 from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
@@ -1773,9 +1774,16 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
             indices, scores, shared_gate = route
 
         output = self._switch_glu(feed_forward.switch_mlp, hidden_states, indices)
-        output = (output * scores[..., None]).sum(axis=-2)
-
         shared_output = super()._feed_forward(feed_forward.shared_expert, hidden_states)
+        combined = (
+            exact_moe_combine(output, shared_output, scores, shared_gate)
+            if os.environ.get("MLX_VLM_QWEN4_FUSED_MOE_COMBINE") == "1"
+            else None
+        )
+        if combined is not None:
+            return combined
+
+        output = (output * scores[..., None]).sum(axis=-2)
         return output + shared_gate * shared_output
 
     def _gated_delta_projections(self, layer, hidden_states):

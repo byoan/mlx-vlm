@@ -81,5 +81,18 @@ The batch-one, single-token input-fusion graph used by chained proposals is
 compiled automatically after binding the drafter. Prompt/history fusion and
 other shapes remain on the eager path.
 
+The exact Qwen4 verifier also has opt-in kernels for the released model's
+BF16 verification intermediates. After enabling the combined MoE projection
+and fused routing path, the weighted routed-expert reduction and gated shared
+expert add can be fused with:
+
+```bash
+export MLX_VLM_QWEN4_FUSED_MOE_COMBINE=1
+```
+
+This kernel is limited to batch-one speculative widths 2 through 8 and the
+released 10-expert, 2560-wide output layout. It preserves MLX's BF16 ten-row
+reduction order and falls back for other shapes or dtypes.
+
 A locally converted target model can be supplied to `--model` in the
 generation command as well.

@@ -13,6 +13,7 @@ from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from mlx_vlm.models.qwen4_exp import exact_sparse_qsa
 from mlx_vlm.models.qwen4_exp.config import TextConfig
+from mlx_vlm.models.qwen4_exp.exact_moe_combine import exact_moe_combine
 from mlx_vlm.models.qwen4_exp.exact_moe_route import exact_moe_route
 from mlx_vlm.models.qwen4_exp.exact_sparse_qsa import Qwen4ExactSparseSelection
 from mlx_vlm.models.qwen4_exp.language import (
@@ -365,6 +366,32 @@ def test_qwen4_fused_moe_route_preserves_cutoff_ties():
     assert mx.array_equal(indices, expected_indices).item()
     assert mx.array_equal(scores, expected_scores).item()
     assert mx.array_equal(shared_gate, mx.full_like(shared_gate, 0.5)).item()
+
+
+@pytest.mark.parametrize("width", [2, 3, 4, 8])
+def test_qwen4_fused_moe_combine_is_exact(width):
+    routed = mx.random.normal(
+        (1, width, 10, 2560), key=mx.random.key(47 + width)
+    ).astype(mx.bfloat16)
+    shared = mx.random.normal((1, width, 2560), key=mx.random.key(53 + width)).astype(
+        mx.bfloat16
+    )
+    scores = mx.softmax(
+        mx.random.normal((1, width, 10), key=mx.random.key(59 + width)),
+        axis=-1,
+    ).astype(mx.bfloat16)
+    shared_gate = mx.sigmoid(
+        mx.random.normal((1, width, 1), key=mx.random.key(61 + width))
+    ).astype(mx.bfloat16)
+
+    expected = (routed * scores[..., None]).sum(axis=-2)
+    expected = expected + shared_gate * shared
+    actual = exact_moe_combine(routed, shared, scores, shared_gate)
+    if actual is None:
+        pytest.skip("exact Qwen4 MoE combination requires Metal")
+
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
 
 
 @pytest.mark.parametrize("width", [2, 3, 4, 8])
