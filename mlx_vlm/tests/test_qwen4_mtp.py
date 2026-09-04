@@ -130,6 +130,39 @@ def test_qwen4_exact_sparse_qsa_gate_is_explicit_and_partition_safe():
             assert exact_sparse_qsa.enabled()
 
 
+@pytest.mark.parametrize("rows", [1, 3, 8])
+def test_qwen4_radix_qsa_topk_matches_argpartition(rows):
+    if (
+        not mx.metal.is_available()
+        or mx.device_info().get("device_name") != "Apple M3 Ultra"
+    ):
+        pytest.skip("QSA radix top-k kernel is specific to Apple M3 Ultra")
+
+    blocks = 16_384
+    scores = mx.floor(
+        16
+        * mx.abs(
+            mx.random.normal(shape=(1, rows, blocks), key=mx.random.key(20 + rows))
+        )
+    )
+    scores = scores.astype(mx.float32)
+    reference = mx.argpartition(scores, kth=-512, axis=-1)[..., -512:]
+    with patch.dict(
+        os.environ,
+        {
+            "MLX_VLM_QWEN4_EXACT_SPARSE_QSA": "1",
+            "MLX_VLM_QWEN4_RADIX_QSA_TOPK": "1",
+            "MLX_SDPA_BLOCKS": "1024",
+        },
+    ):
+        selected = exact_sparse_qsa.select_blocks(scores, 512)
+    mx.eval(reference, selected)
+
+    assert mx.array_equal(
+        mx.sort(reference, axis=-1), mx.sort(selected, axis=-1)
+    ).item()
+
+
 def test_qwen4_exact_sparse_qsa_matches_m3_ultra_sdpa_with_cache_capacity():
     if (
         not mx.metal.is_available()
