@@ -116,6 +116,11 @@ adds about 0.13 GB for the 48-layer checkpoint. Both combined-projection flags
 only affect multi-token exact verification and retain the normal fallback for
 other dtypes and shapes.
 
+Finally, the two 48-value gated-delta control projections can share a 96-row
+BF16 projection by setting `MLX_VLM_QWEN4_COMBINED_GDN_AB_PROJECTION=1`. This
+adds about 18 MB for the checkpoint's 36 gated-delta layers and leaves the
+large QKV and output-gate projections separate to avoid cache-pressure losses.
+
 ## Optional quantization
 
 The official BF16 checkpoint is approximately 360 GB. Depending on the
