@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from bisect import bisect_right
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -61,6 +62,8 @@ class QSAKVCache(KVCache):
         super().__init__()
         self.index_keys = None
         self.index_position_ids = None
+        self._qsa_pooled_keys = None
+        self._qsa_pooled_ratio = None
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
         if self.index_keys is None:
@@ -88,6 +91,7 @@ class QSAKVCache(KVCache):
     def state(self, value):
         self.keys, self.values, self.index_keys, self.index_position_ids = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
+        self._trim_qsa_pool(self.offset)
 
     def trim(self, n):
         n = min(self.offset, n)
@@ -95,7 +99,16 @@ class QSAKVCache(KVCache):
         if self.index_keys is not None:
             self.index_keys = self.index_keys[:, : self.offset]
             self.index_position_ids = self.index_position_ids[..., : self.offset]
+        self._trim_qsa_pool(self.offset)
         return n
+
+    def _trim_qsa_pool(self, index_length):
+        pooled = getattr(self, "_qsa_pooled_keys", None)
+        ratio = getattr(self, "_qsa_pooled_ratio", None)
+        if pooled is None or ratio is None:
+            return
+        blocks = int(index_length) // int(ratio)
+        self._qsa_pooled_keys = pooled[:, :, :blocks]
 
     def extract(self, idx):
         cache = QSAKVCache()
@@ -203,6 +216,8 @@ class BatchQSAKVCache:
         self.index_keys = None
         self.index_position_ids = None
         self.index_offset = 0
+        self._qsa_pooled_keys = None
+        self._qsa_pooled_ratio = None
 
     @property
     def offset(self):
@@ -434,6 +449,11 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        pooled = getattr(self, "_qsa_pooled_keys", None)
+        ratio = getattr(self, "_qsa_pooled_ratio", None)
+        if pooled is not None and ratio is not None:
+            blocks = self.index_offset // int(ratio)
+            self._qsa_pooled_keys = pooled[:, :, :blocks]
         return trimmed
 
     @property
@@ -472,6 +492,11 @@ class BatchQSAKVCache:
         else:
             self.kv_cache.state = kv_state
         self.index_offset = 0 if self.index_keys is None else self.index_keys.shape[1]
+        pooled = getattr(self, "_qsa_pooled_keys", None)
+        ratio = getattr(self, "_qsa_pooled_ratio", None)
+        if pooled is not None and ratio is not None:
+            blocks = self.index_offset // int(ratio)
+            self._qsa_pooled_keys = pooled[:, :, :blocks]
 
     @classmethod
     def from_state(cls, state, meta_state):
@@ -719,7 +744,51 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         block_ids = mx.arange(max_complete_blocks, dtype=mx.int32)
         block_starts = left_padding[:, None] + block_ids[None] * self.compress_ratio
-        if zero_padding:
+        incremental_pool = (
+            os.environ.get("MLX_VLM_QWEN4_INCREMENTAL_QSA_POOL") == "1"
+            and cache is not None
+            and batch == 1
+            and zero_padding
+            and not hasattr(cache, "bits")
+        )
+        if incremental_pool:
+            cached = getattr(cache, "_qsa_pooled_keys", None)
+            cached_blocks = 0 if cached is None else cached.shape[2]
+            if cached_blocks > max_complete_blocks:
+                cached = cached[:, :, :max_complete_blocks]
+                cached_blocks = max_complete_blocks
+            if cached_blocks < max_complete_blocks:
+                new_block_ids = block_ids[cached_blocks:max_complete_blocks]
+                start = cached_blocks * self.compress_ratio
+                complete_key_len = max_complete_blocks * self.compress_ratio
+                new_keys = raw_keys[:, start:complete_key_len].reshape(
+                    batch,
+                    max_complete_blocks - cached_blocks,
+                    self.compress_ratio,
+                    self.head_dim,
+                )
+                new_keys = mx.expand_dims(
+                    self.k_layernorm(
+                        mx.mean(new_keys.astype(mx.float32), axis=2).astype(
+                            raw_keys.dtype
+                        )
+                    ),
+                    axis=1,
+                )
+                new_positions = full_position_ids[
+                    ..., new_block_ids * self.compress_ratio
+                ]
+                new_keys = self._apply_rope(new_keys, new_positions)
+                pooled_keys = (
+                    new_keys
+                    if cached is None
+                    else mx.concatenate([cached, new_keys], axis=2)
+                )
+            else:
+                pooled_keys = cached
+            cache._qsa_pooled_keys = pooled_keys
+            cache._qsa_pooled_ratio = self.compress_ratio
+        elif zero_padding:
             # Use a reshape/view for batches without left padding to avoid
             # gathering the full key history.
             complete_key_len = max_complete_blocks * self.compress_ratio
@@ -743,12 +812,15 @@ class Qwen4ExpQSAIndexer(nn.Module):
             pooled_keys = pooled_keys.reshape(
                 batch, max_complete_blocks, self.compress_ratio, self.head_dim
             )
-        pooled_keys = mx.expand_dims(
-            self.k_layernorm(
-                mx.mean(pooled_keys.astype(mx.float32), axis=2).astype(raw_keys.dtype)
-            ),
-            axis=1,
-        )
+        if not incremental_pool:
+            pooled_keys = mx.expand_dims(
+                self.k_layernorm(
+                    mx.mean(pooled_keys.astype(mx.float32), axis=2).astype(
+                        raw_keys.dtype
+                    )
+                ),
+                axis=1,
+            )
 
         if zero_padding:
             block_position_ids = full_position_ids[..., block_ids * self.compress_ratio]
@@ -766,7 +838,8 @@ class Qwen4ExpQSAIndexer(nn.Module):
             block_position_ids = mx.take_along_axis(
                 full_position_ids, safe_block_starts, axis=1
             )
-        pooled_keys = self._apply_rope(pooled_keys, block_position_ids)
+        if not incremental_pool:
+            pooled_keys = self._apply_rope(pooled_keys, block_position_ids)
 
         # Score in float32, as the reference does: which blocks win is a discrete
         # choice, and rounding the products flips the ones near the cut-off.
