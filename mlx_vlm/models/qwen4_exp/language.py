@@ -37,6 +37,7 @@ from .qsa_kernel import (
 )
 from .exact_moe_combine import exact_moe_combine
 from .exact_moe_route import exact_moe_route
+from .exact_norm import exact_norm
 from .exact_sparse_qsa import Qwen4ExactSparseSelection
 from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
 from .exact_sparse_qsa import select_blocks as select_exact_sparse_qsa_blocks
@@ -833,6 +834,10 @@ class Qwen4ExpRMSNorm(nn.Module):
         self.weight = mx.zeros(dim)
 
     def __call__(self, x: mx.array) -> mx.array:
+        if os.environ.get("MLX_VLM_QWEN4_EXACT_NORM") == "1":
+            output = exact_norm(x, self.weight, self.group_size, self.eps)
+            if output is not None:
+                return output
         dtype = x.dtype
         y = x.astype(mx.float32)
         if self.group_size is not None:

@@ -143,6 +143,14 @@ BF16 projection by setting `MLX_VLM_QWEN4_COMBINED_GDN_AB_PROJECTION=1`. This
 adds about 18 MB for the checkpoint's 36 gated-delta layers and leaves the
 large QKV and output-gate projections separate to avoid cache-pressure losses.
 
+On M3 Ultra, `MLX_VLM_QWEN4_EXACT_NORM=1` fuses the normalization steps after
+the FP32 mean-square reduction. It preserves the original reduction and
+rounding boundaries, including the checkpoint's zero-centered norm weights.
+The path supports single-request BF16 inputs with 1–9 tokens, width 10,240,
+epsilon `1e-6`, and either full-width or 2,560-wide group normalization.
+Other layouts use the original implementation. Both normal decoding and MTP
+verification can use this flag; it does not change checkpoint storage.
+
 ## Optional quantization
 
 The official BF16 checkpoint is approximately 360 GB. Depending on the
