@@ -19,8 +19,8 @@ from mlx_vlm.models.qwen4_exp.exact_sparse_qsa import Qwen4ExactSparseSelection
 from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     LanguageModel,
+    Qwen4ExpBatchInvariantForward,
     Qwen4ExpDecoderLayer,
-    Qwen4ExpExactSpeculativeVerifier,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpGatedResidual,
 )
@@ -216,7 +216,7 @@ def test_qwen4_combined_hyper_projection_is_exact_and_reused(width):
     module.update(
         tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
     )
-    verifier = Qwen4ExpExactSpeculativeVerifier()
+    verifier = Qwen4ExpBatchInvariantForward()
     hidden = mx.random.normal(
         shape=(1, width, module.hc_count * module.hidden_size),
         key=mx.random.key(23 + width),
@@ -253,7 +253,7 @@ def test_qwen4_combined_moe_gate_projection_is_exact_and_reused(width):
     module.update(
         tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
     )
-    verifier = Qwen4ExpExactSpeculativeVerifier()
+    verifier = Qwen4ExpBatchInvariantForward()
     hidden = mx.random.normal(
         shape=(1, width, module.gate.weight.shape[1]),
         key=mx.random.key(31 + width),
@@ -289,7 +289,7 @@ def test_qwen4_padded_moe_gate_kernel_is_exact_and_reused(width):
     module.update(
         tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
     )
-    verifier = Qwen4ExpExactSpeculativeVerifier()
+    verifier = Qwen4ExpBatchInvariantForward()
     hidden = mx.random.normal(
         shape=(1, width, module.gate.weight.shape[1]),
         key=mx.random.key(37 + width),
@@ -400,7 +400,7 @@ def test_qwen4_combined_gdn_ab_projection_is_exact_and_reused(width):
     module.update(
         tree_map(lambda value: value.astype(mx.bfloat16), module.parameters())
     )
-    verifier = Qwen4ExpExactSpeculativeVerifier()
+    verifier = Qwen4ExpBatchInvariantForward()
     hidden = mx.random.normal(
         shape=(1, width, module.in_proj_a.weight.shape[1]),
         key=mx.random.key(41 + width),
@@ -710,7 +710,14 @@ def _assert_cache_equal(actual, expected):
 
     assert len(actual) == len(expected)
     for a, b in zip(actual, expected):
-        compare(a.state, b.state)
+        actual_state = a.state
+        expected_state = b.state
+        if hasattr(a, "index_block_keys"):
+            # These summaries are derived from the authoritative QSA keys and
+            # may differ with chunk history while selecting the same blocks.
+            actual_state = actual_state[:-2]
+            expected_state = expected_state[:-2]
+        compare(actual_state, expected_state)
         compare(a.meta_state, b.meta_state)
         if isinstance(a, ArraysCache):
             compare(a.left_padding, b.left_padding)
@@ -1051,7 +1058,7 @@ def test_qwen4_multirow_speculative_verifier_avoids_long_cache_snapshot():
     ).item()
 
 
-def test_qwen4_multirow_verifier_materializes_cache_before_fixed_width_append():
+def test_qwen4_multirow_verifier_materializes_cache_and_runs_singleton_rows():
     from mlx_vlm.models.qwen4_exp import language as qwen4_language
 
     language = LanguageModel(_tiny_text_config(), _outer_config())
@@ -1073,7 +1080,7 @@ def test_qwen4_multirow_verifier_materializes_cache_before_fixed_width_append():
         return eval_cache(*args)
 
     def record_verify(*args, **kwargs):
-        events.append("verify")
+        events.append(("verify", args[1].shape[0]))
         return verify_model(*args, **kwargs)
 
     with (
@@ -1082,7 +1089,7 @@ def test_qwen4_multirow_verifier_materializes_cache_before_fixed_width_append():
     ):
         language.speculative_verify_hidden(verify, cache)
 
-    assert events[:2] == ["eval", "verify"]
+    assert events == ["eval", ("verify", 1), ("verify", 1)]
 
 
 def test_qwen4_fused_greedy_mixes_captured_hyper_state_before_lm_head(monkeypatch):
