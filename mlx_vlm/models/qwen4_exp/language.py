@@ -30,17 +30,17 @@ from ..qwen3_5.language import (
 from ..qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
-from .qsa_kernel import (
-    QSAExecutionPlan,
-    qsa_sparse_attention,
-    select_qsa_execution_plan,
-)
 from .exact_moe_combine import exact_moe_combine
 from .exact_moe_route import exact_moe_route
 from .exact_norm import exact_norm
 from .exact_sparse_qsa import Qwen4ExactSparseSelection
 from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
 from .exact_sparse_qsa import select_blocks as select_exact_sparse_qsa_blocks
+from .qsa_kernel import (
+    QSAExecutionPlan,
+    qsa_sparse_attention,
+    select_qsa_execution_plan,
+)
 from .sparse_prefill import attention as sparse_prefill_attention
 from .sparse_prefill import enabled as sparse_prefill_enabled
 from .sparse_prefill import fused_enabled as fused_sparse_prefill_enabled
@@ -107,6 +107,7 @@ class QSAKVCache(KVCache):
         self.index_position_ids = None
         self.index_block_keys = None
         self.index_block_ratio = None
+        self._index_block_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
@@ -183,10 +184,12 @@ class QSAKVCache(KVCache):
                 self.index_block_ratio,
             ) = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
+        self._index_block_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
     def clear_index_blocks(self):
+        self._index_block_keys_buffer = None
         self.index_block_keys = None
         self.index_block_ratio = None
 
@@ -232,6 +235,7 @@ class QSAKVCache(KVCache):
                 self.index_position_ids = self.index_position_ids[batch_indices]
         if self.index_block_keys is not None:
             self.index_block_keys = self.index_block_keys[batch_indices]
+        self._index_block_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
@@ -321,10 +325,12 @@ class BatchQSAKVCache:
         self.index_offset = 0
         self.index_block_keys = None
         self.index_block_ratio = None
+        self._index_block_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
     def clear_index_blocks(self):
+        self._index_block_keys_buffer = None
         self.index_block_keys = None
         self.index_block_ratio = None
 
@@ -416,6 +422,7 @@ class BatchQSAKVCache:
             self.index_position_ids = dynamic_roll(
                 self.index_position_ids, right_padding, axis=1
             )
+        self._index_block_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
@@ -437,6 +444,7 @@ class BatchQSAKVCache:
             self.index_keys = self.index_keys[:, min_left:]
             self.index_position_ids = self.index_position_ids[..., min_left:]
             self.index_offset -= min_left
+        self._index_block_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
@@ -519,6 +527,7 @@ class BatchQSAKVCache:
                 [left[1], right[1]], axis=position_axis
             )
             self.index_offset = target
+            self._index_block_keys_buffer = None
             self._index_keys_buffer = None
             self._index_position_ids_buffer = None
 
@@ -670,6 +679,7 @@ class BatchQSAKVCache:
         else:
             self.kv_cache.state = kv_state
         self.index_offset = 0 if self.index_keys is None else self.index_keys.shape[1]
+        self._index_block_keys_buffer = None
         self._index_keys_buffer = None
         self._index_position_ids_buffer = None
 
@@ -755,6 +765,7 @@ class QSAQuantizedKVCache(QuantizedKVCache):
         self.offset = 0 if self.keys is None else self.keys[0].shape[2]
 
     def clear_index_blocks(self):
+        self._index_block_keys_buffer = None
         self.index_block_keys = None
         self.index_block_ratio = None
 
@@ -1073,8 +1084,29 @@ class Qwen4ExpQSAIndexer(nn.Module):
                     full_position_ids, safe_block_starts, axis=1
                 )
             pooled_keys = self._apply_rope(pooled_keys, block_position_ids)
-            if can_reuse_blocks and first_new_block > 0:
-                pooled_keys = mx.concatenate([cached_block_keys, pooled_keys], axis=2)
+            if (
+                os.environ.get("MLX_VLM_QWEN4_PREALLOCATED_QSA_POOL") == "1"
+                and zero_padding
+                and batch == 1
+                and cache is not None
+                and not hasattr(cache, "bits")
+            ):
+                buffer = getattr(cache, "_index_block_keys_buffer", None)
+                if not can_reuse_blocks:
+                    buffer = None
+                elif buffer is None:
+                    buffer = cached_block_keys
+                buffer, pooled_keys = _qsa_preallocated_append(
+                    buffer, pooled_keys, first_new_block, 2
+                )
+                cache._index_block_keys_buffer = buffer
+            else:
+                if cache is not None:
+                    cache._index_block_keys_buffer = None
+                if can_reuse_blocks and first_new_block > 0:
+                    pooled_keys = mx.concatenate(
+                        [cached_block_keys, pooled_keys], axis=2
+                    )
         else:
             pooled_keys = cached_block_keys
 
@@ -2539,6 +2571,7 @@ class LanguageModel(Qwen3_5LanguageModel):
     def _trim_speculative_attention_cache(cache, trim):
         index_block_keys = getattr(cache, "index_block_keys", None)
         index_block_ratio = getattr(cache, "index_block_ratio", None)
+        block_buffer = getattr(cache, "_index_block_keys_buffer", None)
         cache.trim(trim)
         if index_block_keys is None or index_block_ratio is None:
             return
@@ -2546,6 +2579,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         block_count = int(index_length) // int(index_block_ratio)
         cache.index_block_keys = index_block_keys[:, :, :block_count]
         cache.index_block_ratio = index_block_ratio
+        cache._index_block_keys_buffer = block_buffer
 
     def rollback_speculative_cache(
         self,

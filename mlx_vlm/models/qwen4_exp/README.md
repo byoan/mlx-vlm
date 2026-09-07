@@ -242,3 +242,19 @@ python -m mlx_vlm.split_mtp \
   requesting both raises an explicit error to preserve the QSA indexer state.
 - Long image or video prompts may benefit from a smaller
   `--prefill-step-size` to reduce peak memory.
+
+## Optional pooled QSA buffer
+
+`MLX_VLM_QWEN4_PREALLOCATED_QSA_POOL=1` grows completed QSA block summaries
+in 256-block steps, avoiding a full concatenation on every append. It defaults
+to off and applies to single unpadded requests with unquantized KV caches.
+Attention and serialized state see only the logical prefix. Speculative
+rollback retains capacity while trimming visible summaries; state replacement
+and row transformations discard the backing buffer. This uses upstream's
+`index_block_keys` cache rather than the older pooled-cache representation.
+
+On M3 Ultra with the MXFP8 target and native MTP drafter, three interleaved
+164,802-token cached-prefix / 1,024-generated-token pairs measured median
+decode throughput of 34.21 tokens/s without this option and 34.56 with it
+(about 1.0%). All six runs had identical tokens and acceptance traces. This
+is a decode measurement; it does not establish a cold-prefill speedup.
