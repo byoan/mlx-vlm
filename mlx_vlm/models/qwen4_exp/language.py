@@ -41,6 +41,10 @@ from .exact_norm import exact_norm
 from .exact_sparse_qsa import Qwen4ExactSparseSelection
 from .exact_sparse_qsa import enabled as exact_sparse_qsa_enabled
 from .exact_sparse_qsa import select_blocks as select_exact_sparse_qsa_blocks
+from .sparse_prefill import attention as sparse_prefill_attention
+from .sparse_prefill import enabled as sparse_prefill_enabled
+from .sparse_prefill import fused_enabled as fused_sparse_prefill_enabled
+from .sparse_prefill import supports as supports_sparse_prefill
 
 
 def _append_indexer_positions(
@@ -953,12 +957,17 @@ class Qwen4ExpQSAIndexer(nn.Module):
         if (
             return_selection
             and selection is not None
-            and exact_sparse_qsa_enabled()
+            and (
+                exact_sparse_qsa_enabled()
+                and selection.key_len >= 65_536
+                or sparse_prefill_enabled()
+                and qk.shape[1] > 8
+                and selection.key_len >= 32_768
+            )
             and selection.zero_padding
             and selection.selected_blocks.shape[0] == 1
             and cache is not None
             and not hasattr(cache, "bits")
-            and selection.key_len >= 65_536
         ):
             return Qwen4ExactSparseSelection(
                 selection.selected_blocks,
@@ -1182,6 +1191,28 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_ids: Optional[mx.array] = None,
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
+        if supports_sparse_prefill(self, x, cache, mask):
+            selection = self.indexer.from_projected(
+                self.indexer.index_qk_proj(x),
+                cache,
+                position_ids,
+                return_selection=True,
+            )
+            queries, keys, values, gate, prepared_mask = self._prepare_projected_qkv(
+                self.q_proj(x),
+                self.k_proj(x),
+                self.v_proj(x),
+                cache,
+                position_ids,
+                position_embeddings,
+                mask,
+            )
+            output = sparse_prefill_attention(
+                queries, keys, values, selection, self.scale, prepared_mask
+            )
+            output = output.transpose(0, 2, 1, 3).reshape(1, x.shape[1], -1)
+            return self.o_proj(output * mx.sigmoid(gate))
+
         selection = self.indexer.select(x, cache, position_ids)
         if selection is None:
             return super().__call__(
@@ -2174,6 +2205,12 @@ _QWEN4_EXACT_SPECULATIVE_VERIFIER = _QWEN4_BATCH_INVARIANT_FORWARD
 
 class LanguageModel(Qwen3_5LanguageModel):
     requires_multirow_speculative_replay = True
+
+    def apc_key_dependencies(self):
+        # Approximate prefill must not silently reuse the default path's state.
+        if fused_sparse_prefill_enabled():
+            return ("qwen4-fused-sparse-prefill-v1",)
+        return ("qwen4-sparse-prefill-v1",) if sparse_prefill_enabled() else ()
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)

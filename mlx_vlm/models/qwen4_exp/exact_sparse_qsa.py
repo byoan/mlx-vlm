@@ -34,7 +34,7 @@ _TOPK_SOURCE = r"""
             for (uint u = 0; u < 16; ++u) {
                 uint index = base + u * 256;
                 if (index >= N) break;
-                uint key = as_type<uint>(max(values[u], 0.0f));
+                uint key = qsa_score_key(values[u]);
                 if ((key & mask_hi) == prefix) {
                     atomic_fetch_add_explicit(
                         &hist[(key >> shift) & 0xffu], 1u,
@@ -68,7 +68,7 @@ _TOPK_SOURCE = r"""
     uint equal = 0;
     for (uint cursor = end; cursor > begin;) {
         uint index = --cursor;
-        uint key = as_type<uint>(max(row[index], 0.0f));
+        uint key = qsa_score_key(row[index]);
         greater += key > prefix;
         equal += key == prefix;
     }
@@ -94,7 +94,7 @@ _TOPK_SOURCE = r"""
     uint equal_base = K - need;
     for (uint cursor = end; cursor > begin;) {
         uint index = --cursor;
-        uint key = as_type<uint>(max(row[index], 0.0f));
+        uint key = qsa_score_key(row[index]);
         if (key > prefix) out[greater_rank++] = int(index);
         else if (key == prefix) {
             if (equal_rank < need) {
@@ -269,7 +269,16 @@ def _topk_kernel():
         name="qwen4_exact_sparse_qsa_radix_topk",
         input_names=["scores"],
         output_names=["selected"],
-        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        header="""
+            #include <metal_simdgroup>
+            using namespace metal;
+            inline uint qsa_score_key(float value) {
+                // QSA scores are nonnegative or masked with -infinity.
+                // Keep masked blocks below zero-score blocks during prefill.
+                return value < 0.0f ? 0u :
+                    (as_type<uint>(max(value, 0.0f)) | 0x80000000u);
+            }
+        """,
         source=_TOPK_SOURCE,
     )
 
@@ -305,18 +314,32 @@ def enabled():
 def select_blocks(scores, topk):
     """Select QSA blocks with an M3 Ultra top-512 radix kernel when enabled."""
     if (
-        os.environ.get("MLX_VLM_QWEN4_RADIX_QSA_TOPK") != "1"
-        or not enabled()
-        or scores.dtype != mx.float32
+        scores.dtype != mx.float32
         or scores.ndim != 3
         or scores.shape[0] != 1
         or topk != 512
-        or scores.shape[-1] < 16_384
     ):
         return None
 
     rows = scores.shape[1]
     blocks = scores.shape[2]
+    prefill = (
+        rows > 8
+        and blocks >= 8192
+        and (
+            os.environ.get("MLX_VLM_QWEN4_PREFILL_RADIX_QSA_TOPK") == "1"
+            or os.environ.get("MLX_VLM_QWEN4_SPARSE_PREFILL") == "1"
+        )
+        and mx.default_device() == mx.gpu
+        and _is_m3_ultra()
+    )
+    if not prefill and not (
+        os.environ.get("MLX_VLM_QWEN4_RADIX_QSA_TOPK") == "1"
+        and enabled()
+        and blocks >= 16_384
+    ):
+        return None
+
     selected = _topk_kernel()(
         inputs=[mx.contiguous(scores.reshape(rows, blocks))],
         template=[("N", blocks), ("K", topk)],

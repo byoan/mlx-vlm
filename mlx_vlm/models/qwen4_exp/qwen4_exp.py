@@ -13,6 +13,9 @@ _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
 
 
 class Model(Qwen3_5Model):
+    def apc_key_dependencies(self):
+        return self.language_model.apc_key_dependencies()
+
     def __init__(self, config: ModelConfig):
         nn.Module.__init__(self)
         self.config = config

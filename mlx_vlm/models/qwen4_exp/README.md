@@ -151,6 +151,57 @@ epsilon `1e-6`, and either full-width or 2,560-wide group normalization.
 Other layouts use the original implementation. Both normal decoding and MTP
 verification can use this flag; it does not change checkpoint storage.
 
+## Experimental prefill controls
+
+On M3 Ultra, `MLX_VLM_QWEN4_PREFILL_RADIX_QSA_TOPK=1` enables the radix
+block selector for prefill batches with more than eight queries and at least
+8,192 compressed key blocks. Selection preserves the existing cutoff-tie
+behavior and ranks masked future blocks below valid zero-score blocks.
+It can be used independently of the decode attention flags.
+
+`MLX_VLM_QWEN4_SPARSE_PREFILL=1` also enables matrix attention over the
+selected KV rows. The supported layout is an unpadded, single-request BF16
+prefill on M3 Ultra: 24 query heads, two KV heads, head width 256, and a
+512-block QSA budget with four tokens per block. It requires at least 2,048
+cached tokens and 32,768 cached plus new tokens. It falls back for training,
+quantized KV caches, and additive or per-head attention masks. Shared Boolean
+masks, including the single-row MTP batch-cache mask, are intersected with the
+selected positions.
+Temporary KV gathers are bounded to 128 query positions.
+
+Sparse prefill groups sibling query heads into matrix rows. This changes
+floating-point accumulation and can change logits and generated text, despite
+using the same weights and QSA selection rule. Treat it as an optional
+speed/quality tradeoff, rather than an exact replacement for dense masked SDPA.
+APC semantic keys distinguish this mode from the default prefill path.
+
+With unchanged MXFP8 weights and 2,048-token chunks, three cold 164,802-token
+MTP runs on M3 Ultra measured median prefill times of 452.9 seconds for the
+default path and 264.4 seconds for sparse prefill (364 versus 623 tokens/s).
+Generated responses differed. A small 192-token continuation-likelihood probe
+measured 2.3% higher perplexity; this does not establish broad quality
+equivalence. Evaluate the option on your own tasks before adopting it.
+
+Additionally setting `MLX_VLM_QWEN4_FUSED_SPARSE_PREFILL=1` selects a fused
+Metal implementation adapted from [mlx-serve's `gatherQsa256`](https://github.com/ddalcu/mlx-serve/blob/9dd536a1ef860b08c9677c5f1d739ed04b33515e/src/transformer.zig).
+It reads the
+selected keys directly, keeps scores and probabilities in FP32, and supports
+the same shared Boolean masks. This implementation has its own APC semantic
+key because its numerical results differ from the matrix implementation.
+The flag requires `MLX_VLM_QWEN4_SPARSE_PREFILL=1`; both default to off.
+
+Two integrated runs measured 203.15 and 203.08 seconds on the same cold
+164,802-token workload (811 tokens/s), with a 264.43-second matrix control
+between them. A preceding causal-only prototype measured 203.27 seconds.
+The small continuation probe measured 1.7% lower perplexity than baseline;
+this is encouraging but does not establish broad quality equivalence.
+
+Larger `--prefill-step-size` values, such as 8192, are a separate control.
+They can improve matrix utilization but also change numerical results and
+increase working memory. Evaluate chunk size and sparse attention separately
+on representative long-context tasks. Neither flag changes the default chunk
+size or checkpoint quantization.
+
 ## Optional quantization
 
 The official BF16 checkpoint is approximately 360 GB. Depending on the
