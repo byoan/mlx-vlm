@@ -63,6 +63,29 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
             layer_config, use_combine=False
         )
 
+        if config.norm_weights_folded:
+            from mlx.utils import tree_unflatten
+
+            from .readout import FoldedRMSNorm
+
+            self.update_modules(
+                tree_unflatten(
+                    [
+                        (name, FoldedRMSNorm(module))
+                        for name, module in self.named_modules()
+                        if isinstance(module, Qwen4ExpRMSNorm)
+                    ]
+                )
+            )
+        if config.private_draft_io:
+            self.draft_embed_tokens = nn.Embedding(text_config.vocab_size, hidden_size)
+            self.draft_lm_head = nn.Linear(
+                hidden_size, text_config.vocab_size, bias=False
+            )
+        self._draft_head_strategy = config.draft_head_strategy
+        object.__setattr__(self, "_coarse_readout", None)
+        object.__setattr__(self, "_coarse_readout_key", None)
+
         self._input_embed = None
         self._lm_head_fn = None
         self._draft_lm_head = None
@@ -72,7 +95,7 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         self._tokenizer_vocab_size = None
         object.__setattr__(self, "_tokenizer_vocab_mask", None)
         object.__setattr__(self, "_draft_vocab_ids_array", None)
-        self._compile_input_fusion = True
+        self._compile_input_fusion = not config.private_draft_io
         object.__setattr__(self, "_compiled_input_fusion", None)
         self._cache: List[QSAKVCache] = []
         self._seed_token: Optional[mx.array] = None
@@ -94,6 +117,10 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         vocab_ids: Optional[Sequence[int]] = None,
     ) -> None:
         """Use a private quantized copy of target-head rows for drafting."""
+        if self.config.private_draft_io:
+            raise ValueError(
+                "Dedicated Qwen4 MTP uses its checkpoint head; clear draft_head_bits"
+            )
         if bits not in range(2, 9):
             raise ValueError("draft LM-head bits must be between 2 and 8")
         if group_size <= 0 or self.args.hidden_size % group_size:
@@ -117,6 +144,41 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         )
         self._draft_lm_head = None
         self._draft_lm_head_key = None
+
+    @property
+    def requires_sampled_residual(self):
+        return self._draft_head_strategy == "q3_top32_q8"
+
+    def configure_draft_head_strategy(self, strategy="default"):
+        strategy = (
+            self.config.draft_head_strategy if strategy == "default" else strategy
+        )
+        if strategy not in {"shared", "q3_top32_q8"}:
+            raise ValueError("Unsupported Qwen4 draft head strategy")
+        if strategy == "q3_top32_q8" and not self.config.private_draft_io:
+            raise ValueError("q3_top32_q8 requires dedicated checkpoint I/O weights")
+        self._draft_head_strategy = strategy
+        object.__setattr__(self, "_coarse_readout", None)
+        object.__setattr__(self, "_coarse_readout_key", None)
+
+    def _sample_shortlist(self, hidden, sampler, greedy):
+        from .readout import Qwen4DraftReadout
+
+        head = self.draft_lm_head
+        vocab_size = self._tokenizer_vocab_size or self.args.vocab_size
+        key = (id(head.weight), id(head.scales), id(head.biases), vocab_size)
+        if self._coarse_readout_key != key:
+            object.__setattr__(
+                self, "_coarse_readout", Qwen4DraftReadout(head, vocab_size)
+            )
+            object.__setattr__(self, "_coarse_readout_key", key)
+        logits, ids = self._coarse_readout.logits(hidden)
+        sample = getattr(sampler, "sample_draft", None)
+        if callable(sample):
+            return sample(logits, ids).reshape(1, 1)
+        if not greedy:
+            raise ValueError("Sampled Qwen4 top32 drafting requires SampledMTPSampler")
+        return ids[mx.argmax(logits)].reshape(1, 1)
 
     def configure_tokenizer_vocab_size(self, vocab_size: int) -> None:
         """Exclude padded LM-head rows that do not map to tokenizer IDs."""
@@ -153,6 +215,9 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
 
     def bind(self, target_model) -> "Qwen4ExpMTPDraftModel":
         super().bind(target_model)
+        if self.config.private_draft_io:
+            self._input_embed = self.draft_embed_tokens
+            self._lm_head_fn = self.draft_lm_head
         quantization = self._draft_lm_head_quantization
         if quantization is None:
             self._install_compiled_input_fusion()
@@ -219,6 +284,8 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         object.__setattr__(self, "_compiled_input_fusion", compiled)
 
     def _sample_hidden(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
+        if self._draft_head_strategy == "q3_top32_q8":
+            return self._sample_shortlist(hidden, sampler, greedy)
         token = None
         vocab_size = (
             self._tokenizer_vocab_size if self._draft_vocab_ids is None else None
