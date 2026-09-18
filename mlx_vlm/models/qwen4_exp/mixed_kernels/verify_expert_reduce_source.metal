@@ -1,4 +1,4 @@
-// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see donor-LICENSE.
+// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see LICENSE and NOTICE.
 uint p = thread_position_in_grid.x;
 uint row = p / 2560;
 uint col = p % 2560;

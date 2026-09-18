@@ -1,4 +1,4 @@
-// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see donor-LICENSE.
+// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see LICENSE and NOTICE.
 uint lane = thread_index_in_simdgroup;
 uint j = thread_position_in_grid.y;
 uint row = thread_position_in_grid.z;

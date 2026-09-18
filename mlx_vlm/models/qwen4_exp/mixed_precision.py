@@ -10,7 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 
-from .language import Qwen4ExpBatchInvariantForward
+from .language import Qwen4ExpBatchInvariantForward, Qwen4ExpRMSNorm
 
 ROOT = Path(__file__).with_name("mixed_kernels")
 
@@ -149,6 +149,7 @@ def quantized(module, bits):
         and getattr(module, "bits", None) == bits
         and getattr(module, "group_size", None) == 64
         and "bias" not in module
+        and module.weight.dtype == mx.uint32
         and module.scales.dtype == mx.bfloat16
         and module.biases.dtype == mx.bfloat16
     )
@@ -172,7 +173,7 @@ def validate_model(lm):
             p = getattr(ff.switch_mlp, name)
             if not quantized(p, 4) or p.weight.shape != shape:
                 raise ValueError("Unsupported Q4 expert layout: " + name)
-        if not quantized(ff.gate, 8):
+        if not quantized(ff.gate, 8) or ff.gate.weight.shape != (512, 640):
             raise ValueError("mixed_q4_q8 requires Q8 router")
     validate_hyper(lm.model.hyper_connection_mixer)
 
@@ -185,8 +186,21 @@ def validate_hyper(module):
         and down.weight.shape == (320, 2560)
         and up.weight.shape == (10240, 80)
         and module.hc_norm.weight.shape == (10240,)
+        and module.hc_norm.weight.dtype == mx.bfloat16
+        and isinstance(module.hc_norm, Qwen4ExpRMSNorm)
+        and module.hc_norm.group_size == 2560
+        and (module.hidden_size, module.hc_count) == (2560, 4)
     ):
         raise ValueError("Unsupported Q8 hyper-connection layout")
+    if "block_inject_weight" in module:
+        injection = module.block_inject_weight
+        if not (
+            isinstance(injection, nn.Linear)
+            and "bias" not in injection
+            and injection.weight.shape == (4, 10240)
+            and injection.weight.dtype == mx.bfloat16
+        ):
+            raise ValueError("mixed_q4_q8 requires dense BF16 hyper injection weights")
 
 
 class Qwen4MixedVerifier(Qwen4ExpBatchInvariantForward):

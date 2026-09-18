@@ -1,4 +1,4 @@
-// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see donor-LICENSE.
+// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see LICENSE and NOTICE.
 uint tid = thread_index_in_threadgroup;
 uint lane = thread_index_in_simdgroup;
 uint sg = simdgroup_index_in_threadgroup;

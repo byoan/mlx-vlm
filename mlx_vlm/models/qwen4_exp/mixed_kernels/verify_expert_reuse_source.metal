@@ -1,4 +1,4 @@
-// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see donor-LICENSE.
+// Copyright (c) 2026 David Dalcu. MIT. Adapted from mlx-serve; see LICENSE and NOTICE.
 auto lane = thread_index_in_simdgroup;
 auto sg = simdgroup_index_in_threadgroup;
 auto tg = threadgroup_position_in_grid;

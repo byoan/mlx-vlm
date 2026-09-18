@@ -117,3 +117,17 @@ def test_reject_wrong_hyper_quantization(hc):
     hc.input_mix_weight_down.group_size = 32
     with pytest.raises(ValueError):
         validate_hyper(hc)
+
+
+@pytest.mark.parametrize("change", ["group", "injection", "norm"])
+def test_reject_incompatible_hyper_layout(hc, change):
+    if change == "group":
+        hc.hc_norm.group_size = None
+    elif change == "injection":
+        hc.block_inject_weight = hc.block_inject_weight.to_quantized(
+            bits=8, group_size=64
+        )
+    else:
+        hc.hc_norm.weight = hc.hc_norm.weight.astype(mx.float32)
+    with pytest.raises(ValueError):
+        validate_hyper(hc)
