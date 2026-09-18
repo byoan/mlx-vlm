@@ -2262,11 +2262,42 @@ _QWEN4_EXACT_SPECULATIVE_VERIFIER = _QWEN4_BATCH_INVARIANT_FORWARD
 class LanguageModel(Qwen3_5LanguageModel):
     requires_multirow_speculative_replay = True
 
+    def configure_qwen4_optimizations(self, profile="off"):
+        """Select a validated, model-local speculative verifier implementation."""
+        if profile not in {"off", "mixed_q4_q8"}:
+            raise ValueError("Unknown Qwen4 optimization profile")
+        verifier = None
+        if profile == "mixed_q4_q8":
+            from .mixed_precision import Qwen4MixedVerifier, validate_model
+
+            validate_model(self)
+            verifier = Qwen4MixedVerifier()
+        object.__setattr__(self, "_mixed_verifier", verifier)
+        object.__setattr__(self, "_qwen4_optimization_profile", profile)
+        return {
+            "profile": profile,
+            "active": verifier is not None,
+            "verification_batch_size": 1,
+            "verification_widths": [2, 8],
+        }
+
+    def _verification_forward(self, batch, length):
+        verifier = getattr(self, "_mixed_verifier", None)
+        return (
+            verifier
+            if verifier is not None and batch == 1 and 2 <= length <= 8
+            else _QWEN4_BATCH_INVARIANT_FORWARD
+        )
+
     def apc_key_dependencies(self):
-        # Approximate prefill must not silently reuse the default path's state.
-        if fused_sparse_prefill_enabled():
-            return ("qwen4-fused-sparse-prefill-v1",)
-        return ("qwen4-sparse-prefill-v1",) if sparse_prefill_enabled() else ()
+        # Include verification numerics when generated caches are reused.
+        prefix = (
+            ("qwen4-fused-sparse-prefill-v1",)
+            if fused_sparse_prefill_enabled()
+            else (("qwen4-sparse-prefill-v1",) if sparse_prefill_enabled() else ())
+        )
+        profile = getattr(self, "_qwen4_optimization_profile", "off")
+        return prefix if profile == "off" else prefix + (profile,)
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         nn.Module.__init__(self)
@@ -2319,7 +2350,7 @@ class LanguageModel(Qwen3_5LanguageModel):
     def _mtp_logits_hidden(self, hidden: mx.array) -> mx.array:
         hc_width = self.args.hc_count * self.args.hidden_size
         if hidden.shape[-1] == hc_width:
-            return _QWEN4_BATCH_INVARIANT_FORWARD._hyper_connection(
+            return self._verification_forward(*hidden.shape[:2])._hyper_connection(
                 self.model.hyper_connection_mixer, hidden
             )
         return hidden
@@ -2582,7 +2613,7 @@ class LanguageModel(Qwen3_5LanguageModel):
                 else mx.concatenate([output.logits for output in row_outputs], axis=0)
             )
         else:
-            output = _QWEN4_BATCH_INVARIANT_FORWARD(
+            output = self._verification_forward(batch, length)(
                 self,
                 inputs,
                 cache=cache,
