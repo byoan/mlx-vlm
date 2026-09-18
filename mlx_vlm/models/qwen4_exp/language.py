@@ -2000,12 +2000,51 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
             and hasattr(feed_forward, "switch_mlp")
             and hidden_states.ndim == 3
             and hidden_states.shape[1] > 1
-            and feed_forward.gate.weight.dtype == hidden_states.dtype
-            and feed_forward.shared_expert_gate.weight.dtype == hidden_states.dtype
         ):
             return super()._feed_forward(feed_forward, hidden_states)
 
-        projection = self._combined_moe_gate_projection(feed_forward, hidden_states)
+        gates = (feed_forward.gate, feed_forward.shared_expert_gate)
+        dense_gates = all(gate.weight.dtype == hidden_states.dtype for gate in gates)
+        q8_fusion = (
+            os.environ.get("MLX_VLM_QWEN4_Q8_MOE_FUSION") == "1"
+            and os.environ.get("MLX_VLM_QWEN4_FUSED_MOE_ROUTE") == "1"
+            and os.environ.get("MLX_VLM_QWEN4_FUSED_MOE_COMBINE") == "1"
+            and hidden_states.dtype == mx.bfloat16
+            and hidden_states.shape[0] == 1
+            and hidden_states.shape[1] <= 8
+            and hidden_states.shape[-1] == 2560
+            and feed_forward.top_k == 10
+            and tuple(gate.weight.shape[0] for gate in gates) == (512, 1)
+            and isinstance(gates[0], nn.QuantizedLinear)
+            and all(
+                "bias" not in gate
+                and (
+                    (
+                        isinstance(gate, nn.QuantizedLinear)
+                        and gate.mode == "affine"
+                        and gate.bits == 8
+                        and gate.group_size == 64
+                        and gate.scales.dtype == hidden_states.dtype
+                        and gate.biases.dtype == hidden_states.dtype
+                    )
+                    or (
+                        isinstance(gate, nn.Linear)
+                        and gate.weight.dtype == hidden_states.dtype
+                    )
+                )
+                for gate in gates
+            )
+        )
+        if dense_gates:
+            projection = self._combined_moe_gate_projection(feed_forward, hidden_states)
+        elif q8_fusion:
+            # Packed Q8 weights cannot use the combined BF16 projection. Keep
+            # the existing projections, then fuse their routing/reduction tail.
+            projection = mx.concatenate(
+                [self._linear(gate, hidden_states) for gate in gates], axis=-1
+            )
+        else:
+            return super()._feed_forward(feed_forward, hidden_states)
         split = feed_forward.gate.weight.shape[0]
         route = (
             exact_moe_route(projection)
