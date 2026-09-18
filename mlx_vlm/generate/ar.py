@@ -332,6 +332,12 @@ def generate_step(
                 typical_p=typical_p,
             )
 
+    if (
+        getattr(draft_model, "requires_sampled_residual", False)
+        and repetition_penalty == 1
+    ):
+        repetition_penalty = None
+
     processors = _generate_module_override(
         "make_logits_processors", make_logits_processors
     )(
