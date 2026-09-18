@@ -109,6 +109,12 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         self.accept_lens: List[int] = []
         self.draft_lens: List[int] = []
 
+    def prefill_from_target_hidden(self, *args, **kwargs):
+        # The dedicated profile starts its draft cache at the generation boundary.
+        # Full prompt-history drafting is a separate, deliberately disabled option.
+        if not self.config.private_draft_io:
+            return super().prefill_from_target_hidden(*args, **kwargs)
+
     def configure_draft_lm_head(
         self,
         bits: int,
@@ -161,7 +167,10 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         object.__setattr__(self, "_coarse_readout", None)
         object.__setattr__(self, "_coarse_readout_key", None)
 
-    def _sample_shortlist(self, hidden, sampler, greedy):
+    def prepare_draft_readout(self):
+        """Build the Q3 shortlist head on the owner thread before admitting work."""
+        if self._draft_head_strategy != "q3_top32_q8":
+            return
         from .readout import Qwen4DraftReadout
 
         head = self.draft_lm_head
@@ -172,6 +181,9 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
                 self, "_coarse_readout", Qwen4DraftReadout(head, vocab_size)
             )
             object.__setattr__(self, "_coarse_readout_key", key)
+
+    def _sample_shortlist(self, hidden, sampler, greedy):
+        self.prepare_draft_readout()
         logits, ids = self._coarse_readout.logits(hidden)
         sample = getattr(sampler, "sample_draft", None)
         if callable(sample):

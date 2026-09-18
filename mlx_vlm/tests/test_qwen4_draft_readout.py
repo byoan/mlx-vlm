@@ -90,3 +90,34 @@ def test_dedicated_binding_survives_reset_without_target_head_changes():
         draft.configure_draft_lm_head(8, mode="mxfp8")
     with pytest.raises(ValueError):
         ModelConfig(draft_head_strategy="q3_top32_q8")
+
+
+def test_dedicated_readout_warmup_reset_and_no_prompt_history():
+    from dataclasses import replace
+
+    config = ModelConfig(
+        text_config=replace(_tiny_text_config(), hidden_size=64, vocab_size=16416),
+        private_draft_io=True,
+        norm_weights_folded=True,
+        draft_head_strategy="q3_top32_q8",
+    )
+    draft = Qwen4ExpMTPDraftModel(config)
+    draft.set_dtype(mx.bfloat16)
+    draft.draft_lm_head = draft.draft_lm_head.to_quantized(bits=8, group_size=64)
+    draft.configure_tokenizer_vocab_size(16391)
+    draft.prepare_draft_readout()
+    original = draft._coarse_readout
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=nn.Embedding(16416, 64)),
+        lm_head=nn.Linear(64, 16416, bias=False),
+    )
+    draft.reset(target)
+    draft.prepare_draft_readout()
+    assert draft._coarse_readout is original
+    draft.prefill_from_target_hidden(None, None, None, None)
+    assert all(c.offset == 0 for c in draft._cache)
+    assert draft._seed_token is None
+    draft.configure_tokenizer_vocab_size(16384)
+    draft.prepare_draft_readout()
+    assert draft._coarse_readout.vocab_size == 16384
+    assert draft._coarse_readout is not original
