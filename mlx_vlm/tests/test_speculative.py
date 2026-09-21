@@ -20,6 +20,7 @@ from mlx.utils import tree_flatten, tree_map
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.laguna.language as laguna_language
+import mlx_vlm.models.qwen3_5.gated_delta as qwen_gated_delta
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
@@ -618,9 +619,13 @@ def test_qwen_gdn_verify_update_matches_stepwise_path():
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
-def test_qwen_gdn_verify_can_omit_the_live_final_state():
+@pytest.mark.parametrize("B", [1, 2, 3, 4, 5, 6, 7, 8, 16, 32])
+@pytest.mark.parametrize("S", [1, 2, 3, 8])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("save_states", [False, True])
+def test_qwen_gdn_verify_can_omit_the_live_final_state(B, S, masked, save_states):
     mx.random.seed(27)
-    B, S, Hk, D, Hv, Dv = 1, 3, 2, 64, 4, 16
+    Hk, D, Hv, Dv = 2, 64, 4, 16
     q = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
     k = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
     v = mx.random.normal((B, S, Hv, Dv)).astype(mx.bfloat16)
@@ -629,18 +634,201 @@ def test_qwen_gdn_verify_can_omit_the_live_final_state():
     A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
     dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
     state = mx.zeros((B, Hv, Dv, D), dtype=mx.float32)
+    mask = (
+        mx.array([[step >= row % S for step in range(S)] for row in range(B)])
+        if masked
+        else None
+    )
+    state_steps = S - 1 if save_states else 0
 
     full = qwen_verifier.gated_delta_update_with_states(
-        q, k, v, a, b, A_log, dt_bias, state, state_steps=S
+        q, k, v, a, b, A_log, dt_bias, state, mask, state_steps=S
     )
     shortened = qwen_verifier.gated_delta_update_with_states(
-        q, k, v, a, b, A_log, dt_bias, state, state_steps=S - 1
+        q, k, v, a, b, A_log, dt_bias, state, mask, state_steps=state_steps
     )
     mx.eval(*full, *shortened)
 
     assert bool(mx.array_equal(full[0], shortened[0]).item())
     assert bool(mx.array_equal(full[1], shortened[1]).item())
-    assert bool(mx.array_equal(full[2][:, :-1], shortened[2]).item())
+    assert shortened[2].shape == (B, state_steps, Hv, Dv, D)
+    assert bool(mx.array_equal(full[2][:, :state_steps], shortened[2]).item())
+
+
+def _qwen_gdn_batch_inputs(B, S, dtype, masked, head_dims=(2, 64, 4, 16)):
+    Hk, D, Hv, Dv = head_dims
+    # Match the normalized q/k used by the model and start with nonzero state.
+    q = mx.random.normal((B, S, Hk, D))
+    k = mx.random.normal((B, S, Hk, D))
+    q = (q / mx.linalg.norm(q, axis=-1, keepdims=True)).astype(dtype)
+    k = (k / mx.linalg.norm(k, axis=-1, keepdims=True)).astype(dtype)
+    v = mx.random.normal((B, S, Hv, Dv)).astype(dtype)
+    a = mx.random.normal((B, S, Hv)).astype(dtype)
+    b = mx.random.normal((B, S, Hv)).astype(dtype)
+    A_log = mx.random.normal((Hv,)).astype(dtype)
+    dt_bias = mx.ones((Hv,), dtype=dtype)
+    state = mx.random.normal((B, Hv, Dv, D)) * 0.1
+    # Include an entirely masked row, left padding, and interleaved valid steps.
+    mask = (
+        mx.array(
+            [
+                [
+                    row % 3 != 0
+                    and (step >= row % S if row % 3 == 1 else step % 2 == 0)
+                    for step in range(S)
+                ]
+                for row in range(B)
+            ]
+        )
+        if masked
+        else None
+    )
+    return (q, k, v, a, b, A_log, dt_bias), state, mask
+
+
+def _qwen_gdn_cpu_reference(inputs, state, mask):
+    q, k, v, a, b, A_log, dt_bias = inputs
+    # Share gate values with the Metal path: CPU/GPU BF16 sigmoid/softplus
+    # rounding can differ. Only the recurrent update is under test here.
+    g, beta = qwen_gated_delta._compute_g_beta(A_log, a, b, dt_bias)
+    mx.eval(g, beta)
+    with mx.stream(mx.cpu):
+        reference = qwen_gated_delta._gated_delta_with_states_ops(
+            q, k, v, g, beta, state, mask
+        )
+        mx.eval(*reference)
+    return reference
+
+
+def _assert_qwen_gdn_reference_close(actual, expected):
+    # BF16/FP16 output rounding and different reduction orders are expected;
+    # recurrent states remain FP32 and must agree to much tighter tolerances.
+    atol = {mx.bfloat16: 2e-3, mx.float16: 2e-4, mx.float32: 2e-6}[actual.dtype]
+    assert bool(mx.all(mx.isfinite(actual)).item())
+    assert bool(mx.allclose(actual, expected, rtol=1e-4, atol=atol).item())
+
+
+@pytest.mark.parametrize("B", [1, 2, 3, 6, 8])
+@pytest.mark.parametrize("S", [1, 3, 8])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.skipif(
+    not mx.metal.is_available() or mx.default_device() != mx.gpu,
+    reason="Requires Metal kernels",
+)
+def test_qwen_gdn_saved_states_match_cpu_and_independent_rows(B, S, dtype, masked):
+    mx.random.seed(29)
+    inputs, state, mask = _qwen_gdn_batch_inputs(B, S, dtype, masked)
+    reference = _qwen_gdn_cpu_reference(inputs, state, mask)
+    ordinary = qwen_language.gated_delta_update(*inputs, state, mask)
+    mx.eval(*ordinary)
+
+    for state_steps in sorted({0, 1, S - 1, S}):
+        actual = qwen_verifier.gated_delta_update_with_states(
+            *inputs, state, mask, state_steps=state_steps
+        )
+        mx.eval(*actual)
+        for got, expected in zip(actual[:2], ordinary):
+            assert bool(mx.array_equal(got, expected).item())
+        for got, expected in zip(
+            actual, (*reference[:2], reference[2][:, :state_steps])
+        ):
+            _assert_qwen_gdn_reference_close(got, expected)
+
+        # Each batched row must be bit-for-bit identical to its singleton call.
+        for row in range(B):
+            row_inputs = tuple(x[row : row + 1] for x in inputs[:5]) + inputs[5:]
+            single = qwen_verifier.gated_delta_update_with_states(
+                *row_inputs,
+                state[row : row + 1],
+                None if mask is None else mask[row : row + 1],
+                state_steps=state_steps,
+            )
+            mx.eval(*single)
+            for got, expected in zip(actual, single):
+                assert bool(mx.array_equal(got[row : row + 1], expected).item())
+
+
+@pytest.mark.parametrize("B", [1, 2, 6])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.skipif(
+    not mx.metal.is_available() or mx.default_device() != mx.gpu,
+    reason="Requires Metal kernels",
+)
+def test_qwen_gdn_partial_states_at_qwen35b_head_dimensions(B, masked):
+    mx.random.seed(37)
+    inputs, state, mask = _qwen_gdn_batch_inputs(
+        B, 3, mx.bfloat16, masked, head_dims=(16, 128, 32, 128)
+    )
+    reference = _qwen_gdn_cpu_reference(inputs, state, mask)
+    actual = qwen_verifier.gated_delta_update_with_states(
+        *inputs, state, mask, state_steps=2
+    )
+    mx.eval(*actual)
+    for got, expected in zip(actual, (*reference[:2], reference[2][:, :2])):
+        _assert_qwen_gdn_reference_close(got, expected)
+
+
+@pytest.mark.parametrize("B", [1, 2, 3, 6, 8, 16])
+@pytest.mark.parametrize("S", [1, 3, 8])
+@pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.skipif(
+    not mx.metal.is_available() or mx.default_device() != mx.gpu,
+    reason="Requires Metal kernels",
+)
+def test_qwen_gdn_partial_state_rollback_with_shrinking_batch(B, S, masked):
+    mx.random.seed(31)
+    state = reference_state = None
+    previous_batch = None
+    for round_index, batch in enumerate(
+        sorted({B, max(1, B - 1), max(1, B // 2), 1}, reverse=True)
+    ):
+        inputs, initial_state, mask = _qwen_gdn_batch_inputs(
+            batch, S, mx.bfloat16, masked
+        )
+        if state is None:
+            state = reference_state = initial_state
+        else:
+            # Keep non-prefix rows in reverse order, as finished rows are removed.
+            keep = mx.array(
+                list(range(previous_batch - 1, previous_batch - batch - 1, -1))
+            )
+            state, reference_state = state[keep], reference_state[keep]
+        actual = qwen_verifier.gated_delta_update_with_states(
+            *inputs, state, mask, state_steps=S - 1
+        )
+        reference = _qwen_gdn_cpu_reference(inputs, reference_state, mask)
+        mx.eval(*actual)
+        for got, expected in zip(actual, (*reference[:2], reference[2][:, : S - 1])):
+            _assert_qwen_gdn_reference_close(got, expected)
+
+        # Test every acceptance depth; offsets differ between rows. The last
+        # depth uses the separate live state because its snapshot was omitted.
+        conv_input = mx.random.normal((batch, S + 3, 8)).astype(mx.bfloat16)
+        live_conv = conv_input[:, S : S + 3]
+        for offset in range(S):
+            accepted = [(row + round_index + offset) % S for row in range(batch)]
+            state, conv = qwen_language.gated_delta_accept_states(
+                actual[2],
+                conv_input,
+                actual[1],
+                live_conv,
+                mx.array(accepted, dtype=mx.int32),
+                kernel_size=4,
+            )
+            reference_state = mx.stack(
+                [reference[2][row, step] for row, step in enumerate(accepted)]
+            )
+            reference_conv = mx.concatenate(
+                [
+                    conv_input[row : row + 1, step + 1 : step + 4]
+                    for row, step in enumerate(accepted)
+                ]
+            )
+            mx.eval(state, conv, reference_state, reference_conv)
+            _assert_qwen_gdn_reference_close(state, reference_state)
+            assert bool(mx.array_equal(conv, reference_conv).item())
+        previous_batch = batch
 
 
 def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
