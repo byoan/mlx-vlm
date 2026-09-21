@@ -608,6 +608,25 @@ def parse_arguments():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--draft-head-bits",
+        type=int,
+        choices=range(2, 9),
+        default=None,
+        help="Use a private quantized LM head for drafting when supported.",
+    )
+    parser.add_argument(
+        "--draft-head-mode",
+        choices=("affine", "mxfp8"),
+        default="affine",
+        help="Quantization mode for a private draft LM head (default: affine).",
+    )
+    parser.add_argument(
+        "--draft-vocab",
+        type=str,
+        default=None,
+        help='JSON file containing a sorted draft token-ID list or {"ids": [...]}',
+    )
+    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         help=(
@@ -1396,6 +1415,38 @@ def main():
             )
             draft_model = None
             args.draft_kind = None
+        if draft_model is not None and args.draft_head_bits is not None:
+            configure_head = getattr(draft_model, "configure_draft_lm_head", None)
+            if configure_head is None:
+                raise ValueError(
+                    f"{type(draft_model).__name__} does not support --draft-head-bits"
+                )
+            draft_vocab = None
+            if args.draft_vocab is not None:
+                with open(args.draft_vocab, encoding="utf-8") as source:
+                    draft_vocab = json.load(source)
+                if isinstance(draft_vocab, dict):
+                    draft_vocab = draft_vocab.get("ids")
+                if not isinstance(draft_vocab, list):
+                    raise ValueError(
+                        "--draft-vocab must contain a JSON list or an 'ids' list"
+                    )
+                draft_vocab = sorted(set(int(token) for token in draft_vocab))
+            configure_head(
+                args.draft_head_bits,
+                mode=args.draft_head_mode,
+                vocab_ids=draft_vocab,
+            )
+            draft_model.bind(model)
+            print(
+                "  → using a private "
+                f"{args.draft_head_bits}-bit {args.draft_head_mode} draft LM head"
+                + (
+                    f" over {len(draft_vocab)} ranked tokens."
+                    if draft_vocab is not None
+                    else "."
+                )
+            )
 
     prompt = args.prompt
 

@@ -40,7 +40,7 @@ include = ["mlx_vlm*"]
 exclude = ["mlx_vlm.tests*"]
 
 [tool.setuptools.package-data]
-mlx_vlm = ["py.typed"]
+mlx_vlm = ["py.typed", "models/qwen4_exp/mixed_kernels/*", "speculative/drafters/qwen4_exp_mtp/kernels/*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mlx_vlm.version.__version__"}

@@ -13,6 +13,9 @@ _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
 
 
 class Model(Qwen3_5Model):
+    def apc_key_dependencies(self):
+        return self.language_model.apc_key_dependencies()
+
     def __init__(self, config: ModelConfig):
         nn.Module.__init__(self)
         self.config = config
@@ -25,7 +28,7 @@ class Model(Qwen3_5Model):
         weights = {
             key: value for key, value in weights.items() if not key.startswith("mtp.")
         }
-        weights = convert_qwen4_exp_fp8_weights(weights)
+        weights = convert_qwen4_exp_fp8_weights(weights, native_mxfp8=True)
         if self.config.text_config.ple_storage:
             weights = {
                 key: value
@@ -57,6 +60,19 @@ class Model(Qwen3_5Model):
                 weights[f"{prefix}.switch_mlp.down_proj.{destination}"] = weights.pop(
                     down_key
                 )
+                gate_up_scales_key = f"{prefix}.experts.gate_up_proj_scales"
+                if gate_up_scales_key in weights:
+                    gate_up_scales = weights.pop(gate_up_scales_key)
+                    scales_midpoint = gate_up_scales.shape[-2] // 2
+                    weights[f"{prefix}.switch_mlp.gate_proj.scales"] = gate_up_scales[
+                        ..., :scales_midpoint, :
+                    ]
+                    weights[f"{prefix}.switch_mlp.up_proj.scales"] = gate_up_scales[
+                        ..., scales_midpoint:, :
+                    ]
+                    weights[f"{prefix}.switch_mlp.down_proj.scales"] = weights.pop(
+                        f"{prefix}.experts.down_proj_scales"
+                    )
 
         sanitized = {}
         for key, value in weights.items():

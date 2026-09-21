@@ -12,8 +12,15 @@ class Qwen4ExpMTPConfig(BaseModelConfig):
     text_config: Optional[TextConfig] = None
     block_size: int = 2
     tie_word_embeddings: bool = False
+    private_draft_io: bool = False
+    norm_weights_folded: bool = False
+    draft_head_strategy: str = "shared"
 
     def __post_init__(self):
+        if self.draft_head_strategy not in {"shared", "q3_top32_q8"}:
+            raise ValueError("Unsupported Qwen4 draft_head_strategy")
+        if self.draft_head_strategy == "q3_top32_q8" and not self.private_draft_io:
+            raise ValueError("q3_top32_q8 requires a dedicated embedding and Q8 head")
         if isinstance(self.text_config, dict):
             self.text_config = TextConfig.from_dict(self.text_config)
         if self.text_config is not None:

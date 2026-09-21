@@ -93,9 +93,120 @@ mlx_vlm.generate \
   --max-tokens 128
 ```
 
-The released checkpoint contains one MTP layer, so the default draft block is
-one speculative token. `--draft-block-size` can chain the head for additional
-draft tokens; the best value depends on the prompt and hardware.
+The released checkpoint contains one MTP layer. The runtime adaptively chains
+that head with a default ceiling of four total verification tokens (one seed
+plus up to three proposals). `--draft-block-size` overrides this ceiling;
+the best value depends on the prompt and hardware.
+
+On Apple M3 Ultra, long-context QSA verification can use an exact sparse
+attention kernel by setting `MLX_VLM_QWEN4_EXACT_SPARSE_QSA=1`. The kernel is
+limited to the checkpoint's 24 query heads, 2 KV heads, and 256-wide BF16/FP16
+attention layout. It preserves MLX's 1,024-partition accumulation order and
+falls back to the regular attention path for unsupported shapes, devices,
+cache layouts, or `MLX_SDPA_BLOCKS` overrides.
+
+The same M3 Ultra path can replace generic QSA block partitioning with a
+fixed top-512 radix selector by also setting
+`MLX_VLM_QWEN4_RADIX_QSA_TOPK=1`. It keeps the existing FP32 scores and MLX
+cutoff-tie behavior, and falls back to `argpartition` outside the checkpoint's
+long-context single-request verification layout.
+
+Verification can also combine the hyper-connection mix and injection
+projections by setting `MLX_VLM_QWEN4_COMBINED_HYPER_PROJECTION=1`. This keeps
+the singleton evaluation order used by exact verification while sharing the
+input read across both BF16 projections. The combined weights use about 0.6 GB
+for the 48-layer checkpoint and are held only for the lifetime of the model.
+
+The MoE router and shared-expert gate can similarly share their BF16 input
+projection by setting `MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION=1`. This
+adds about 0.13 GB for the 48-layer checkpoint. Both combined-projection flags
+only affect multi-token exact verification and retain the normal fallback for
+other dtypes and shapes.
+
+On Metal, `MLX_VLM_QWEN4_PADDED_MOE_GATE_KERNEL=1` can additionally pad the
+checkpoint's 513-row combined router projection to 516 rows and use the exact
+multi-token BF16 verification kernel. The padded rows are discarded. This
+requires `MLX_VLM_QWEN4_COMBINED_MOE_GATE_PROJECTION=1`, preserves the
+singleton accumulation and rounding order, and falls back for unsupported
+dtypes or shapes.
+
+The checkpoint's precise softmax, stable top-10 selection, BF16 score
+renormalization, and shared-gate sigmoid can then be fused into one Metal
+dispatch with `MLX_VLM_QWEN4_FUSED_MOE_ROUTE=1`. This requires both combined
+MoE projection flags above and only applies to the checkpoint's 512-expert,
+top-10, BF16 verifier layout. Unsupported layouts retain the standard path.
+The split projection/tail organization was informed by
+[MTPLX PR #391](https://github.com/youssofal/MTPLX/pull/391); the mlx-vlm
+kernel supports its dynamic verification widths and MXFP8 checkpoint.
+
+Finally, the two 48-value gated-delta control projections can share a 96-row
+BF16 projection by setting `MLX_VLM_QWEN4_COMBINED_GDN_AB_PROJECTION=1`. This
+adds about 18 MB for the checkpoint's 36 gated-delta layers and leaves the
+large QKV and output-gate projections separate to avoid cache-pressure losses.
+
+On M3 Ultra, `MLX_VLM_QWEN4_EXACT_NORM=1` fuses the normalization steps after
+the FP32 mean-square reduction. It preserves the original reduction and
+rounding boundaries, including the checkpoint's zero-centered norm weights.
+The path supports single-request BF16 inputs with 1–9 tokens, width 10,240,
+epsilon `1e-6`, and either full-width or 2,560-wide group normalization.
+Other layouts use the original implementation. Both normal decoding and MTP
+verification can use this flag; it does not change checkpoint storage.
+
+Performance measurements below were collected on the previous custom branch
+(`dev-qwen4-mtp-no-replay`). They have not been repeated on the upstream 0.7.2
+port; see [port notes](../../../UPSTREAM_PORT.md) for validation and remaining
+hardware checks.
+
+## Experimental prefill controls
+
+On M3 Ultra, `MLX_VLM_QWEN4_PREFILL_RADIX_QSA_TOPK=1` enables the radix
+block selector for prefill batches with more than eight queries and at least
+8,192 compressed key blocks. Selection preserves the existing cutoff-tie
+behavior and ranks masked future blocks below valid zero-score blocks.
+It can be used independently of the decode attention flags.
+
+`MLX_VLM_QWEN4_SPARSE_PREFILL=1` also enables matrix attention over the
+selected KV rows. The supported layout is an unpadded, single-request BF16
+prefill on M3 Ultra: 24 query heads, two KV heads, head width 256, and a
+512-block QSA budget with four tokens per block. It requires at least 2,048
+cached tokens and 32,768 cached plus new tokens. It falls back for training,
+quantized KV caches, and additive or per-head attention masks. Shared Boolean
+masks, including the single-row MTP batch-cache mask, are intersected with the
+selected positions.
+Temporary KV gathers are bounded to 128 query positions.
+
+Sparse prefill groups sibling query heads into matrix rows. This changes
+floating-point accumulation and can change logits and generated text, despite
+using the same weights and QSA selection rule. Treat it as an optional
+speed/quality tradeoff, rather than an exact replacement for dense masked SDPA.
+APC semantic keys distinguish this mode from the default prefill path.
+
+With unchanged MXFP8 weights and 2,048-token chunks, three cold 164,802-token
+MTP runs on M3 Ultra measured median prefill times of 452.9 seconds for the
+default path and 264.4 seconds for sparse prefill (364 versus 623 tokens/s).
+Generated responses differed. A small 192-token continuation-likelihood probe
+measured 2.3% higher perplexity; this does not establish broad quality
+equivalence. Evaluate the option on your own tasks before adopting it.
+
+Additionally setting `MLX_VLM_QWEN4_FUSED_SPARSE_PREFILL=1` selects a fused
+Metal implementation adapted from [mlx-serve's `gatherQsa256`](https://github.com/ddalcu/mlx-serve/blob/9dd536a1ef860b08c9677c5f1d739ed04b33515e/src/transformer.zig).
+It reads the
+selected keys directly, keeps scores and probabilities in FP32, and supports
+the same shared Boolean masks. This implementation has its own APC semantic
+key because its numerical results differ from the matrix implementation.
+The flag requires `MLX_VLM_QWEN4_SPARSE_PREFILL=1`; both default to off.
+
+Two integrated runs measured 203.15 and 203.08 seconds on the same cold
+164,802-token workload (811 tokens/s), with a 264.43-second matrix control
+between them. A preceding causal-only prototype measured 203.27 seconds.
+The small continuation probe measured 1.7% lower perplexity than baseline;
+this is encouraging but does not establish broad quality equivalence.
+
+Larger `--prefill-step-size` values, such as 8192, are a separate control.
+They can improve matrix utilization but also change numerical results and
+increase working memory. Evaluate chunk size and sparse attention separately
+on representative long-context tasks. Neither flag changes the default chunk
+size or checkpoint quantization.
 
 ## Optional quantization
 
@@ -137,3 +248,19 @@ python -m mlx_vlm.split_mtp \
   requesting both raises an explicit error to preserve the QSA indexer state.
 - Long image or video prompts may benefit from a smaller
   `--prefill-step-size` to reduce peak memory.
+
+## Optional pooled QSA buffer
+
+`MLX_VLM_QWEN4_PREALLOCATED_QSA_POOL=1` grows completed QSA block summaries
+in 256-block steps, avoiding a full concatenation on every append. It defaults
+to off and applies to single unpadded requests with unquantized KV caches.
+Attention and serialized state see only the logical prefix. Speculative
+rollback retains capacity while trimming visible summaries; state replacement
+and row transformations discard the backing buffer. This uses upstream's
+`index_block_keys` cache rather than the older pooled-cache representation.
+
+On M3 Ultra with the MXFP8 target and native MTP drafter, three interleaved
+164,802-token cached-prefix / 1,024-generated-token pairs measured median
+decode throughput of 34.21 tokens/s without this option and 34.56 with it
+(about 1.0%). All six runs had identical tokens and acceptance traces. This
+is a decode measurement; it does not establish a cold-prefill speedup.

@@ -5,7 +5,7 @@ from collections import defaultdict
 
 import mlx.core as mx
 
-from ...fp8 import _dequantize_fp8_weight
+from ...fp8 import MLX_MXFP8_QUANTIZATION, _dequantize_fp8_weight
 
 _EXPERT_WEIGHT_RE = re.compile(
     r"^(.*\.layers\.\d+\.mlp)\.experts\.(\d+)\."
@@ -14,8 +14,15 @@ _EXPERT_WEIGHT_RE = re.compile(
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
 
 
-def convert_qwen4_exp_fp8_weights(weights: dict[str, mx.array]):
-    """Restore FP8 experts/PLE and pack experts into mlx-vlm's model layout."""
+def convert_qwen4_exp_fp8_weights(
+    weights: dict[str, mx.array], *, native_mxfp8: bool = False
+):
+    """Restore FP8 experts/PLE and pack experts into mlx-vlm's model layout.
+
+    The target loader requests native MXFP8 for raw tensors. Already-converted
+    tensors retain the shared FP8 loader's requested quantization, including
+    affine layouts selected during MTP extraction.
+    """
     has_fp8_experts = any(
         _EXPERT_WEIGHT_RE.match(key)
         and (
@@ -39,11 +46,15 @@ def convert_qwen4_exp_fp8_weights(weights: dict[str, mx.array]):
         parameter_prefix = key[: -len(".weight")]
         scale_key = f"{parameter_prefix}.scales"
         if scale_inv_key in converted:
-            expert_groups[prefix][projection][int(expert)] = {
-                "dense": _dequantize_fp8_weight(
-                    converted.pop(key), converted.pop(scale_inv_key)
-                )
-            }
+            restored = _dequantize_fp8_weight(
+                converted.pop(key), converted.pop(scale_inv_key)
+            )
+            if native_mxfp8:
+                packed, scales = mx.quantize(restored, **MLX_MXFP8_QUANTIZATION)
+                parameters = {"weight": packed, "scales": scales}
+            else:
+                parameters = {"dense": restored}
+            expert_groups[prefix][projection][int(expert)] = parameters
         elif scale_key in converted:
             parameters = {
                 "weight": converted.pop(key),
@@ -117,8 +128,12 @@ def convert_qwen4_exp_fp8_weights(weights: dict[str, mx.array]):
             weight = converted[shard_key]
             if weight.dtype != mx.uint8:
                 raise ValueError(f"FP8 PLE shard must load as uint8: {shard_key!r}.")
-            converted[shard_key] = mx.from_fp8(
-                weight, dtype=mx.bfloat16
-            ) * scale.reshape(())
+            restored = mx.from_fp8(weight, dtype=mx.bfloat16) * scale.reshape(())
+            if native_mxfp8:
+                packed, scales = mx.quantize(restored, **MLX_MXFP8_QUANTIZATION)
+                converted[shard_key] = packed
+                converted[shard_key[: -len(".weight")] + ".scales"] = scales
+            else:
+                converted[shard_key] = restored
 
     return converted

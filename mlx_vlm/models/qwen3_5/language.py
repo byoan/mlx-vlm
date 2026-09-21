@@ -23,6 +23,23 @@ from .speculative_verifier import Qwen3_5ExactSpeculativeVerifier
 _EXACT_SPECULATIVE_VERIFIER = Qwen3_5ExactSpeculativeVerifier()
 
 
+def _target_verify_linear(linear, x: mx.array, target_verify: bool = False):
+    """Compatibility hook for mlx-server's ordinary prefill acceleration.
+
+    Transactional verification calls the shared speculative operators directly,
+    so installing a prefill hook cannot change its reduction or cache behavior.
+    """
+    if target_verify:
+        return _EXACT_SPECULATIVE_VERIFIER._linear(linear, x)
+    return linear(x)
+
+
+def _target_verify_linears(linears, x: mx.array, target_verify: bool = False):
+    if target_verify:
+        return _EXACT_SPECULATIVE_VERIFIER._linears(linears, x)
+    return tuple(linear(x) for linear in linears)
+
+
 class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
     def __init__(
         self,
@@ -580,9 +597,7 @@ def _qwen3_5_ragged_sdpa_one_pass_kernel(dtype, d_size, v_size):
 def _qwen3_5_ragged_sdpa_two_pass_1_kernel(dtype, d_size, v_size, blocks):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
-        name=(
-            f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_" f"d{d_size}_v{v_size}_b{blocks}"
-        ),
+        name=(f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_d{d_size}_v{v_size}_b{blocks}"),
         input_names=["queries", "keys", "values", "pads", "scale", "k_size"],
         output_names=["partials", "sums", "maxs"],
         header="#include <metal_simdgroup>\nusing namespace metal;\n",
@@ -895,10 +910,8 @@ class Qwen3_5Attention(nn.Module):
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
-        q_proj_output, keys, values = (
-            self.q_proj(x),
-            self.k_proj(x),
-            self.v_proj(x),
+        q_proj_output, keys, values = _target_verify_linears(
+            (self.q_proj, self.k_proj, self.v_proj), x, False
         )
         queries, keys, values, gate, mask = self._prepare_projected_qkv(
             q_proj_output,
@@ -927,7 +940,7 @@ class Qwen3_5Attention(nn.Module):
             )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        return _target_verify_linear(self.o_proj, output * mx.sigmoid(gate), False)
 
     def _prepare_projected_qkv(
         self,
@@ -1074,7 +1087,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return q, k
 
     def _project_gates(self, inputs: mx.array):
-        return self.in_proj_b(inputs), self.in_proj_a(inputs)
+        return _target_verify_linears((self.in_proj_b, self.in_proj_a), inputs, False)
 
     def __call__(
         self,
@@ -1083,8 +1096,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        mixed_qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs)
+        mixed_qkv, z = _target_verify_linears(
+            (self.in_proj_qkv, self.in_proj_z), inputs, False
+        )
         b, a = self._project_gates(inputs)
 
         z = z.reshape(B, S, -1, self.head_v_dim)
@@ -1152,7 +1166,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        return _target_verify_linear(self.out_proj, out.reshape(B, S, -1), False)
 
 
 class Qwen3_5DecoderLayer(nn.Module):
@@ -1825,12 +1839,45 @@ class LanguageModel(nn.Module):
             return out
         return self.lm_head(hidden)
 
+    def configure_tokenizer_vocab_size(self, vocab_size: int) -> None:
+        """Exclude padded LM-head rows that do not map to tokenizer IDs."""
+        vocab_size = int(vocab_size)
+        if vocab_size <= 0:
+            raise ValueError("tokenizer vocabulary size must be positive")
+        self._tokenizer_vocab_size = vocab_size
+        object.__setattr__(self, "_tokenizer_vocab_mask", None)
+
+    def _tokenizer_token_mask(self, rows: int, head_size: int) -> Optional[mx.array]:
+        vocab_size = getattr(self, "_tokenizer_vocab_size", None)
+        if vocab_size is None or vocab_size >= head_size:
+            return None
+        token_mask = getattr(self, "_tokenizer_vocab_mask", None)
+        if token_mask is None:
+            full_words, remainder = divmod(vocab_size, 32)
+            parts = [mx.full((1, full_words), -1, dtype=mx.int32)]
+            if remainder:
+                parts.append(mx.array([[(1 << remainder) - 1]], dtype=mx.int32))
+            tail_words = (head_size + 31) // 32 - full_words - bool(remainder)
+            if tail_words:
+                parts.append(mx.zeros((1, tail_words), dtype=mx.int32))
+            token_mask = mx.concatenate(parts, axis=1)
+            object.__setattr__(self, "_tokenizer_vocab_mask", token_mask)
+        return mx.contiguous(mx.broadcast_to(token_mask, (rows, token_mask.shape[1])))
+
     def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
         if not self.args.tie_word_embeddings:
-            out = _EXACT_SPECULATIVE_VERIFIER.quantized_argmax(self.lm_head, hidden)
+            token_mask = LanguageModel._tokenizer_token_mask(
+                self, hidden.shape[0] * hidden.shape[1], self.lm_head.weight.shape[0]
+            )
+            out = _EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
+                self.lm_head, hidden, token_mask=token_mask
+            )
             if out is not None:
                 return out
         logits = self.speculative_logits_from_hidden(hidden)
+        vocab_size = getattr(self, "_tokenizer_vocab_size", None)
+        if vocab_size is not None:
+            logits = logits[..., :vocab_size]
         return mx.argmax(logits, axis=-1)
 
     def supports_fused_greedy_logits_processors(self, logits_processors) -> bool:
@@ -1877,6 +1924,15 @@ class LanguageModel(nn.Module):
             token_mask = _EXACT_SPECULATIVE_VERIFIER.pad_token_mask(
                 token_mask, self.lm_head.weight.shape[0]
             )
+        tokenizer_mask = LanguageModel._tokenizer_token_mask(
+            self, inputs.shape[0], self.lm_head.weight.shape[0]
+        )
+        if tokenizer_mask is not None:
+            token_mask = (
+                tokenizer_mask
+                if token_mask is None
+                else mx.bitwise_and(token_mask, tokenizer_mask)
+            )
 
         output = self(
             inputs,
@@ -1893,7 +1949,11 @@ class LanguageModel(nn.Module):
             return sampled
         if token_mask is not None:
             raise RuntimeError("masked fused greedy decode became unsupported")
-        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
+        logits = self.speculative_logits_from_hidden(hidden)
+        vocab_size = getattr(self, "_tokenizer_vocab_size", None)
+        if vocab_size is not None:
+            logits = logits[..., :vocab_size]
+        return mx.argmax(logits, axis=-1)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(

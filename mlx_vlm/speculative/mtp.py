@@ -463,6 +463,9 @@ def _mtp_acceptance_walk(
     row_id: int = 0,
     base_position: Optional[int] = None,
 ) -> Tuple[int, List[int]]:
+    walk = getattr(sampler, "speculative_accept", None)
+    if callable(walk):
+        return walk(lm, verify.hidden, draft_tokens, budget, row_id, base_position or 0)
     if verify.target_tokens is not None:
         mx.async_eval(verify.target_tokens, verify.hidden)
         return _speculative_walk(draft_tokens, verify.target_tokens, budget)
@@ -605,6 +608,9 @@ def _mtp_rounds(
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
+    reset_sampler = getattr(sampler, "reset_draft", None)
+    if callable(reset_sampler):
+        reset_sampler()
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling
@@ -898,6 +904,8 @@ def _mtp_rounds_batch(
     lm = model.language_model if hasattr(model, "language_model") else model
 
     B = first_bonus.shape[0]
+    if callable(getattr(sampler, "speculative_accept", None)) and B != 1:
+        raise ValueError("Sampled residual MTP requires one active sequence")
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     if (
@@ -917,6 +925,9 @@ def _mtp_rounds_batch(
         draft_model.reset(model, left_padding=left_padding)
     else:
         draft_model.reset(model)
+    reset_sampler = getattr(sampler, "reset_draft", None)
+    if callable(reset_sampler):
+        reset_sampler()
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
         enabled=not greedy_sampling
@@ -1014,7 +1025,19 @@ def _mtp_rounds_batch(
 
             # Walk per-row
             budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-            if verify.target_tokens is not None:
+            walk = getattr(sampler, "speculative_accept", None)
+            if callable(walk):
+                accepted, new_tokens = walk(
+                    lm,
+                    hidden_full,
+                    draft_tokens,
+                    budgets[0],
+                    row_ids[active_idx[0]],
+                    emitted[active_idx[0]],
+                )
+                accepted_list, new_tokens_list = [accepted], [new_tokens]
+                sampler_rng.target_sampled(sync_draft=False)
+            elif verify.target_tokens is not None:
                 sampler_rng.target_eval(verify.target_tokens, hidden_full)
                 accepted_list, new_tokens_list = _speculative_walk_batch(
                     draft_tokens, verify.target_tokens, budgets

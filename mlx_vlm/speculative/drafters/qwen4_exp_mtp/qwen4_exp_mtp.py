@@ -1,11 +1,12 @@
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ....models.qwen3_5.language import _create_qwen3_5_attention_mask
 from ....models.qwen4_exp.language import (
+    _QWEN4_EXACT_SPECULATIVE_VERIFIER,
     QSAKVCache,
     Qwen4ExpDecoderLayer,
     Qwen4ExpGatedResidual,
@@ -59,6 +60,247 @@ class Qwen4ExpMTPDraftModel(AutoregressiveMTPDraftModel):
             layer_config, use_combine=False
         )
 
+        if config.norm_weights_folded:
+            from mlx.utils import tree_unflatten
+
+            from .readout import FoldedRMSNorm
+
+            self.update_modules(
+                tree_unflatten(
+                    [
+                        (name, FoldedRMSNorm(module))
+                        for name, module in self.named_modules()
+                        if isinstance(module, Qwen4ExpRMSNorm)
+                    ]
+                )
+            )
+        if config.private_draft_io:
+            self.draft_embed_tokens = nn.Embedding(text_config.vocab_size, hidden_size)
+            self.draft_lm_head = nn.Linear(
+                hidden_size, text_config.vocab_size, bias=False
+            )
+        self._draft_head_strategy = config.draft_head_strategy
+        object.__setattr__(self, "_coarse_readout", None)
+        object.__setattr__(self, "_coarse_readout_key", None)
+
+        self._draft_lm_head = None
+        self._draft_lm_head_key = None
+        self._draft_lm_head_quantization = None
+        self._draft_vocab_ids = None
+        self._tokenizer_vocab_size = None
+        object.__setattr__(self, "_tokenizer_vocab_mask", None)
+        object.__setattr__(self, "_draft_vocab_ids_array", None)
+        self._compile_input_fusion = not config.private_draft_io
+        object.__setattr__(self, "_compiled_input_fusion", None)
+
+    def prefill_from_target_hidden(self, *args, **kwargs):
+        # The dedicated profile starts its draft cache at the generation boundary.
+        # Full prompt-history drafting is a separate, deliberately disabled option.
+        if not self.config.private_draft_io:
+            return super().prefill_from_target_hidden(*args, **kwargs)
+
+    def configure_draft_lm_head(
+        self,
+        bits: int,
+        group_size: int = 32,
+        mode: str = "affine",
+        vocab_ids: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Use a private quantized copy of target-head rows for drafting."""
+        if self.config.private_draft_io:
+            raise ValueError(
+                "Dedicated Qwen4 MTP uses its checkpoint head; clear draft_head_bits"
+            )
+        if bits not in range(2, 9):
+            raise ValueError("draft LM-head bits must be between 2 and 8")
+        if group_size <= 0 or self.args.hidden_size % group_size:
+            raise ValueError(
+                "draft LM-head group size must divide the model hidden size"
+            )
+        if vocab_ids is not None:
+            vocab_ids = tuple(int(token) for token in vocab_ids)
+            if not vocab_ids:
+                raise ValueError("draft vocabulary must not be empty")
+            if any(token < 0 for token in vocab_ids):
+                raise ValueError("draft vocabulary token IDs must be non-negative")
+            if any(a >= b for a, b in zip(vocab_ids, vocab_ids[1:])):
+                raise ValueError("draft vocabulary token IDs must be unique and sorted")
+        self._draft_lm_head_quantization = (group_size, bits, mode)
+        self._draft_vocab_ids = vocab_ids
+        object.__setattr__(
+            self,
+            "_draft_vocab_ids_array",
+            None if vocab_ids is None else mx.array(vocab_ids, dtype=mx.uint32),
+        )
+        self._draft_lm_head = None
+        self._draft_lm_head_key = None
+
+    @property
+    def requires_sampled_residual(self):
+        return self._draft_head_strategy == "q3_top32_q8"
+
+    def configure_draft_head_strategy(self, strategy="default"):
+        strategy = (
+            self.config.draft_head_strategy if strategy == "default" else strategy
+        )
+        if strategy not in {"shared", "q3_top32_q8"}:
+            raise ValueError("Unsupported Qwen4 draft head strategy")
+        if strategy == "q3_top32_q8" and not self.config.private_draft_io:
+            raise ValueError("q3_top32_q8 requires dedicated checkpoint I/O weights")
+        self._draft_head_strategy = strategy
+        object.__setattr__(self, "_coarse_readout", None)
+        object.__setattr__(self, "_coarse_readout_key", None)
+
+    def prepare_draft_readout(self):
+        """Build the Q3 shortlist head on the owner thread before admitting work."""
+        if self._draft_head_strategy != "q3_top32_q8":
+            return
+        from .readout import Qwen4DraftReadout
+
+        head = self.draft_lm_head
+        vocab_size = self._tokenizer_vocab_size or self.args.vocab_size
+        key = (id(head.weight), id(head.scales), id(head.biases), vocab_size)
+        if self._coarse_readout_key != key:
+            object.__setattr__(
+                self, "_coarse_readout", Qwen4DraftReadout(head, vocab_size)
+            )
+            object.__setattr__(self, "_coarse_readout_key", key)
+
+    def _sample_shortlist(self, hidden, sampler, greedy):
+        self.prepare_draft_readout()
+        logits, ids = self._coarse_readout.logits(hidden)
+        sample = getattr(sampler, "sample_draft", None)
+        if callable(sample):
+            return sample(logits, ids).reshape(1, 1)
+        if not greedy:
+            raise ValueError("Sampled Qwen4 top32 drafting requires SampledMTPSampler")
+        return ids[mx.argmax(logits)].reshape(1, 1)
+
+    def configure_tokenizer_vocab_size(self, vocab_size: int) -> None:
+        """Exclude padded LM-head rows that do not map to tokenizer IDs."""
+        vocab_size = int(vocab_size)
+        if vocab_size <= 0:
+            raise ValueError("tokenizer vocabulary size must be positive")
+        if (
+            self._draft_vocab_ids is not None
+            and self._draft_vocab_ids[-1] >= vocab_size
+        ):
+            raise ValueError("draft vocabulary token ID exceeds tokenizer vocabulary")
+        self._tokenizer_vocab_size = vocab_size
+        object.__setattr__(self, "_tokenizer_vocab_mask", None)
+
+    def _draft_head_token_mask(self, hidden: mx.array) -> Optional[mx.array]:
+        if self._draft_vocab_ids is not None or self._tokenizer_vocab_size is None:
+            return None
+        head_size = self._draft_lm_head.weight.shape[0]
+        if self._tokenizer_vocab_size >= head_size:
+            return None
+        token_mask = self._tokenizer_vocab_mask
+        if token_mask is None:
+            full_words, remainder = divmod(self._tokenizer_vocab_size, 32)
+            parts = [mx.full((1, full_words), -1, dtype=mx.int32)]
+            if remainder:
+                parts.append(mx.array([[(1 << remainder) - 1]], dtype=mx.int32))
+            tail_words = (head_size + 31) // 32 - full_words - bool(remainder)
+            if tail_words:
+                parts.append(mx.zeros((1, tail_words), dtype=mx.int32))
+            token_mask = mx.concatenate(parts, axis=1)
+            object.__setattr__(self, "_tokenizer_vocab_mask", token_mask)
+        rows = hidden.shape[0] * hidden.shape[1]
+        return mx.contiguous(mx.broadcast_to(token_mask, (rows, token_mask.shape[1])))
+
+    def bind(self, target_model) -> "Qwen4ExpMTPDraftModel":
+        super().bind(target_model)
+        if self.config.private_draft_io:
+            self._input_embed = self.draft_embed_tokens
+            self._lm_head_fn = self.draft_lm_head
+        quantization = self._draft_lm_head_quantization
+        if quantization is None:
+            self._install_compiled_input_fusion()
+            return self
+
+        target_head = self._lm_head_fn
+        if not isinstance(target_head, nn.Linear):
+            raise ValueError(
+                "Qwen4 draft LM-head quantization requires a dense target LM head"
+            )
+        group_size, bits, mode = quantization
+        vocab_ids = self._draft_vocab_ids
+        if vocab_ids is not None and vocab_ids[-1] >= target_head.weight.shape[0]:
+            raise ValueError("draft vocabulary token ID exceeds target vocabulary size")
+        key = (id(target_head.weight), group_size, bits, mode, id(vocab_ids))
+        if self._draft_lm_head is None or self._draft_lm_head_key != key:
+            draft_head = target_head
+            if vocab_ids is not None:
+                draft_head = nn.Linear(
+                    target_head.weight.shape[1],
+                    len(vocab_ids),
+                    bias=getattr(target_head, "bias", None) is not None,
+                )
+                vocab_array = self._draft_vocab_ids_array
+                draft_head.weight = mx.take(target_head.weight, vocab_array, axis=0)
+                if getattr(target_head, "bias", None) is not None:
+                    draft_head.bias = mx.take(target_head.bias, vocab_array, axis=0)
+            self._draft_lm_head = draft_head.to_quantized(
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
+            mx.eval(self._draft_lm_head.parameters())
+            self._draft_lm_head_key = key
+        self._lm_head_fn = self._draft_lm_head
+        self._install_compiled_input_fusion()
+        return self
+
+    def configure_compiled_input_fusion(self, enabled: bool = True) -> None:
+        """Select compiled batch-one, single-token input fusion."""
+        self._compile_input_fusion = bool(enabled)
+        if not enabled:
+            object.__setattr__(self, "_compiled_input_fusion", None)
+
+    def _install_compiled_input_fusion(self) -> None:
+        if not self._compile_input_fusion or self._compiled_input_fusion is not None:
+            return
+        width = self.args.hc_count * self.args.hidden_size
+        dtype = self.pre_fc_norm_hidden.weight.dtype
+        if dtype not in (mx.bfloat16, mx.float16):
+            return
+        hidden = mx.arange(width, dtype=mx.float32).reshape(1, 1, width).astype(dtype)
+        token_embed = (
+            mx.arange(self.args.hidden_size, dtype=mx.float32)
+            .reshape(1, 1, self.args.hidden_size)
+            .astype(dtype)
+        )
+        expected = self._fuse_inputs_eager(token_embed, hidden)
+        compiled = mx.compile(self._fuse_inputs_eager)
+        actual = compiled(token_embed, hidden)
+        mx.eval(expected, actual)
+        if not mx.array_equal(actual, expected).item():
+            raise RuntimeError("compiled Qwen4 MTP input fusion failed exact parity")
+        object.__setattr__(self, "_compiled_input_fusion", compiled)
+
+    def _sample_hidden(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
+        if self._draft_head_strategy == "q3_top32_q8":
+            return self._sample_shortlist(hidden, sampler, greedy)
+        token = None
+        vocab_size = (
+            self._tokenizer_vocab_size if self._draft_vocab_ids is None else None
+        )
+        if greedy and self._draft_lm_head is not None:
+            token = _QWEN4_EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
+                self._draft_lm_head,
+                hidden,
+                token_mask=self._draft_head_token_mask(hidden),
+            )
+        if token is None:
+            logits = self._lm_head_fn(hidden)
+            if vocab_size is not None:
+                logits = logits[..., :vocab_size]
+            token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+        if self._draft_vocab_ids is not None:
+            token = mx.take(self._draft_vocab_ids_array, token)
+        return token
+
     @property
     def quant_predicate(self):
         def predicate(path, _):
@@ -92,7 +334,7 @@ class Qwen4ExpMTPDraftModel(AutoregressiveMTPDraftModel):
             )
         return hidden
 
-    def fuse_inputs(
+    def _fuse_inputs_eager(
         self,
         token_embed: mx.array,
         hidden: mx.array,
@@ -106,6 +348,20 @@ class Qwen4ExpMTPDraftModel(AutoregressiveMTPDraftModel):
         return (projected_embedding[..., None, :] + projected_hidden).reshape(
             hidden.shape
         )
+
+    def fuse_inputs(
+        self,
+        token_embed: mx.array,
+        hidden: mx.array,
+    ) -> mx.array:
+        hidden = self._target_hidden(hidden)
+        if (
+            self._compiled_input_fusion is not None
+            and hidden.shape[:2] == (1, 1)
+            and token_embed.shape[:2] == (1, 1)
+        ):
+            return self._compiled_input_fusion(token_embed, hidden)
+        return self._fuse_inputs_eager(token_embed, hidden)
 
     def _forward_hidden(
         self,
@@ -141,6 +397,9 @@ class Qwen4ExpMTPDraftModel(AutoregressiveMTPDraftModel):
 
         gate_up_key = "layers.0.mlp.experts.gate_up_proj"
         down_key = "layers.0.mlp.experts.down_proj"
+        for key in (gate_up_key, down_key):
+            if key + "_scales" in stripped:
+                stripped[key + ".scales"] = stripped.pop(key + "_scales")
         for parameter in (None, "weight", "scales", "biases"):
             suffix = "" if parameter is None else f".{parameter}"
             source_key = gate_up_key + suffix

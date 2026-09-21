@@ -292,6 +292,22 @@ def generate_step(
     )
 
     sampler_is_greedy = sampler is None and temperature == 0
+    if getattr(draft_model, "requires_sampled_residual", False):
+        from ..speculative.sampled_mtp import SampledMTPSampler, prepare_mtp_sampler
+
+        if min_p or top_n_sigma or p_less or typical_p != 1.0:
+            raise ValueError(
+                "Qwen4 two-stage MTP supports temperature, top-k and top-p only"
+            )
+        if sampler is None and temperature > 0:
+            sampler = SampledMTPSampler(temperature, top_k, top_p, seed)
+        else:
+            sampler = prepare_mtp_sampler(draft_model, sampler, sampler_is_greedy)
+        sampler_vocab = getattr(draft_model, "_tokenizer_vocab_size", None)
+        if sampler_vocab is None:
+            sampler_vocab = draft_model.args.vocab_size
+        if hasattr(sampler, "set_vocabulary"):
+            sampler.set_vocabulary(sampler_vocab)
     if sampler is None:
         if (
             seed is not None
@@ -318,6 +334,12 @@ def generate_step(
                 typical_p=typical_p,
             )
 
+    if (
+        getattr(draft_model, "requires_sampled_residual", False)
+        and repetition_penalty == 1
+    ):
+        repetition_penalty = None
+
     processors = _generate_module_override(
         "make_logits_processors", make_logits_processors
     )(
@@ -331,6 +353,8 @@ def generate_step(
     )
     if logits_processors is not None:
         processors.extend(logits_processors)
+    if processors and getattr(draft_model, "requires_sampled_residual", False):
+        raise ValueError("Qwen4 two-stage MTP does not support logits processors")
 
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
@@ -1067,6 +1091,48 @@ def _sample_with_positions(
     if callable(sample_target) and row_ids is not None and positions is not None:
         return sample_target(logprobs, row_ids=row_ids, positions=positions)
     return sampler(logprobs)
+
+
+def _tokenizer_output_size(tokenizer) -> Optional[int]:
+    """Return the highest decodable token ID plus one, when discoverable."""
+
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    vocab = get_vocab() if callable(get_vocab) else getattr(tokenizer, "vocab", None)
+    if not isinstance(vocab, dict) or not vocab:
+        return None
+    return max(int(token_id) for token_id in vocab.values()) + 1
+
+
+def _limit_sampler_vocab(sampler, vocab_size: Optional[int]):
+    """Hide padded model-output rows from all sampler entry points."""
+
+    if vocab_size is None:
+        return sampler
+
+    def trim(logprobs):
+        return logprobs[..., :vocab_size]
+
+    def wrapped(logprobs):
+        return sampler(trim(logprobs))
+
+    configure_vocab = getattr(sampler, "set_vocabulary", None)
+    if callable(configure_vocab):
+        configure_vocab(vocab_size)
+    for name in ("sample_draft", "speculative_accept", "reset_draft"):
+        method = getattr(sampler, name, None)
+        if callable(method):
+            setattr(wrapped, name, method)
+
+    for method_name in ("sample_target", "sample_proposal"):
+        method = getattr(sampler, method_name, None)
+        if not callable(method):
+            continue
+
+        def positioned(logprobs, *, row_ids, positions, _method=method):
+            return _method(trim(logprobs), row_ids=row_ids, positions=positions)
+
+        setattr(wrapped, method_name, positioned)
+    return wrapped
 
 
 class GenerationBatch:
@@ -2481,6 +2547,16 @@ class BatchGenerator:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
+        if getattr(draft_model, "requires_sampled_residual", False):
+            from ..speculative.sampled_mtp import prepare_mtp_sampler
+
+            sampler = prepare_mtp_sampler(draft_model, sampler, self.greedy_sampling)
+            # This drafter's readout and retained-q verifier are singleton paths.
+            completion_batch_size = prefill_batch_size = 1
+            if any(self.logits_processors):
+                raise ValueError(
+                    "Qwen4 two-stage MTP does not support logits processors"
+                )
         if self.draft_model is not None:
             compute_logprobs = False
             top_logprobs_k = 0
@@ -2498,7 +2574,21 @@ class BatchGenerator:
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        tokenizer_output_size = _tokenizer_output_size(self.tokenizer)
+        self.sampler = _limit_sampler_vocab(
+            sampler or (lambda x: mx.argmax(x, axis=-1)), tokenizer_output_size
+        )
+        language_model = getattr(self.model, "language_model", self.model)
+        configure_target_vocab = getattr(
+            language_model, "configure_tokenizer_vocab_size", None
+        )
+        if callable(configure_target_vocab) and tokenizer_output_size is not None:
+            configure_target_vocab(tokenizer_output_size)
+        configure_vocab = getattr(
+            self.draft_model, "configure_tokenizer_vocab_size", None
+        )
+        if callable(configure_vocab) and tokenizer_output_size is not None:
+            configure_vocab(tokenizer_output_size)
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
@@ -2851,7 +2941,7 @@ class BatchGenerator:
         return self._stream
 
     def close(self):
-        if self._wire_stack is not None:
+        if getattr(self, "_wire_stack", None) is not None:
             self._wire_stack.close()
             self._wire_stack = None
 
@@ -2889,6 +2979,10 @@ class BatchGenerator:
             logits_processors = [self.logits_processors] * len(prompts)
         elif len(logits_processors) != len(prompts):
             raise ValueError("Insufficient number of logits_processors provided")
+        if getattr(
+            getattr(self, "draft_model", None), "requires_sampled_residual", False
+        ) and any(logits_processors):
+            raise ValueError("Qwen4 two-stage MTP does not support logits processors")
         if thinking_budget_criteria is None:
             thinking_budget_criteria = [None] * len(prompts)
         elif len(thinking_budget_criteria) != len(prompts):
