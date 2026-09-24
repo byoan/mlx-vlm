@@ -7,6 +7,7 @@ from typing import Callable, Optional
 import mlx.core as mx
 
 from ..base import scaled_dot_product_attention
+from ..cache import KVCache
 
 
 class QSAExecutionPlan(str, Enum):
@@ -76,13 +77,19 @@ _QSA_SPARSE_ATTENTION_SOURCE = r"""
 
         U score = -3.4028234663852886e38f;
         if (valid) {
-            const device T* kptr =
-                keys + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
-                         key_pos) * D_SIZE) +
-                int(simd_lid) * qk_per_thread;
+            const device T* kptr;
+            if constexpr (STRIDED_KV) {
+                kptr = keys + batch_idx * keys_strides[0] +
+                    kv_head_idx * keys_strides[1] + key_pos * keys_strides[2] +
+                    int(simd_lid) * qk_per_thread * keys_strides[3];
+            } else {
+                kptr = keys +
+                    (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                      key_pos) * D_SIZE) + int(simd_lid) * qk_per_thread;
+            }
             score = 0;
             for (int j = 0; j < qk_per_thread; ++j) {
-                score += q[j] * static_cast<U>(kptr[j]);
+                score += q[j] * static_cast<U>(kptr[STRIDED_KV ? j * keys_strides[3] : j]);
             }
             score = simd_sum(score);
         }
@@ -94,12 +101,18 @@ _QSA_SPARSE_ATTENTION_SOURCE = r"""
         sum_exp_score = sum_exp_score * factor + exp_score;
 
         if (valid) {
-            const device T* vptr =
-                values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
-                           key_pos) * D_SIZE) +
-                int(simd_lid) * v_per_thread;
+            const device T* vptr;
+            if constexpr (STRIDED_KV) {
+                vptr = values + batch_idx * values_strides[0] +
+                    kv_head_idx * values_strides[1] + key_pos * values_strides[2] +
+                    int(simd_lid) * v_per_thread * values_strides[3];
+            } else {
+                vptr = values +
+                    (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                      key_pos) * D_SIZE) + int(simd_lid) * v_per_thread;
+            }
             for (int j = 0; j < v_per_thread; ++j) {
-                o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
+                o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[STRIDED_KV ? j * values_strides[3] : j]);
             }
         } else {
             for (int j = 0; j < v_per_thread; ++j) {
@@ -114,13 +127,19 @@ _QSA_SPARSE_ATTENTION_SOURCE = r"""
     int tail_pos = tail_start + int(simd_gid);
     bool valid_tail = tail_pos < query_end && tail_pos < key_length;
     if (valid_tail) {
-        const device T* kptr =
-            keys + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
-                     tail_pos) * D_SIZE) +
-            int(simd_lid) * qk_per_thread;
+        const device T* kptr;
+        if constexpr (STRIDED_KV) {
+            kptr = keys + batch_idx * keys_strides[0] +
+                kv_head_idx * keys_strides[1] + tail_pos * keys_strides[2] +
+                int(simd_lid) * qk_per_thread * keys_strides[3];
+        } else {
+            kptr = keys +
+                (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                  tail_pos) * D_SIZE) + int(simd_lid) * qk_per_thread;
+        }
         U score = 0;
         for (int j = 0; j < qk_per_thread; ++j) {
-            score += q[j] * static_cast<U>(kptr[j]);
+            score += q[j] * static_cast<U>(kptr[STRIDED_KV ? j * keys_strides[3] : j]);
         }
         score = simd_sum(score);
 
@@ -130,12 +149,18 @@ _QSA_SPARSE_ATTENTION_SOURCE = r"""
         max_score = new_max;
         sum_exp_score = sum_exp_score * factor + exp_score;
 
-        const device T* vptr =
-            values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
-                       tail_pos) * D_SIZE) +
-            int(simd_lid) * v_per_thread;
+        const device T* vptr;
+        if constexpr (STRIDED_KV) {
+            vptr = values + batch_idx * values_strides[0] +
+                kv_head_idx * values_strides[1] + tail_pos * values_strides[2] +
+                int(simd_lid) * v_per_thread * values_strides[3];
+        } else {
+            vptr = values +
+                (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                  tail_pos) * D_SIZE) + int(simd_lid) * v_per_thread;
+        }
         for (int j = 0; j < v_per_thread; ++j) {
-            o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[j]);
+            o[j] = o[j] * factor + exp_score * static_cast<U>(vptr[STRIDED_KV ? j * values_strides[3] : j]);
         }
     }
 
@@ -175,13 +200,14 @@ def _qsa_sparse_attention_kernel(
     topk_blocks: int,
     q_heads: int,
     kv_heads: int,
+    strided_kv: bool = False,
 ):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
         name=(
             "qwen4_exp_qsa_sparse_attention_"
             f"{dtype_name}_d{d_size}_s{selected_length}_b{block_size}_"
-            f"k{topk_blocks}_qh{q_heads}_kh{kv_heads}"
+            f"k{topk_blocks}_qh{q_heads}_kh{kv_heads}_strided{int(strided_kv)}"
         ),
         input_names=[
             "queries",
@@ -194,8 +220,64 @@ def _qsa_sparse_attention_kernel(
         ],
         output_names=["out"],
         header="#include <metal_simdgroup>\nusing namespace metal;\n",
-        source=_QSA_SPARSE_ATTENTION_SOURCE,
+        source=(
+            f"constexpr bool STRIDED_KV = {str(strided_kv).lower()};\n"
+            + _QSA_SPARSE_ATTENTION_SOURCE
+        ),
+        ensure_row_contiguous=not strided_kv,
     )
+
+
+# Measured crossover on M3 Ultra: near parity at 12K, a win from 16K.
+_STRIDED_QSA_MIN_CONTEXT = 16_384
+
+
+@lru_cache(maxsize=1)
+def _strided_qsa_device_supported():
+    return (
+        mx.metal.is_available()
+        and mx.device_info().get("device_name") == "Apple M3 Ultra"
+    )
+
+
+def _use_strided_qsa(queries, keys, values, cache, block_size, topk_blocks):
+    """Recognize padded prefixes returned by the standard KV cache, without eval.
+
+    MLX does not expose lazy array strides to Python. The standard cache's
+    update_and_fetch returns prefix views of its capacity buffers, so capacity
+    greater than the logical length identifies padding between the two KV heads.
+    Unknown cache implementations and restored views with no visible spare
+    capacity conservatively retain the contiguous path.
+    """
+    if (
+        queries.shape[0] != 1
+        or queries.shape[1] != 24
+        or queries.shape[2] not in (1, 2)
+        or queries.shape[3] != 256
+        or queries.dtype != mx.bfloat16
+        or keys.shape[1] != 2
+        or keys.shape[2] < _STRIDED_QSA_MIN_CONTEXT
+        or block_size != 4
+        or topk_blocks != 512
+        or getattr(type(cache), "update_and_fetch", None)
+        is not KVCache.update_and_fetch
+        or not isinstance(cache.offset, int)
+        or cache.offset != keys.shape[2]
+        or mx.default_device() != mx.gpu
+        or not _strided_qsa_device_supported()
+    ):
+        return False
+    for buffer, prefix in ((cache.keys, keys), (cache.values, values)):
+        if (
+            not isinstance(buffer, mx.array)
+            or buffer.ndim != 4
+            or buffer.dtype != prefix.dtype
+            or buffer.shape[:2] != prefix.shape[:2]
+            or buffer.shape[3] != prefix.shape[3]
+            or buffer.shape[2] <= prefix.shape[2]
+        ):
+            return False
+    return True
 
 
 @lru_cache(maxsize=128)
@@ -276,6 +358,7 @@ def qsa_sparse_attention(
     block_size: int,
     allow_sparse_decode: bool = False,
     _plan: Optional[QSAExecutionPlan] = None,
+    cache=None,
 ) -> mx.array:
     """Attend directly to QSA-selected blocks without gathering or a dense mask."""
 
@@ -301,9 +384,11 @@ def qsa_sparse_attention(
     topk_blocks = block_indices.shape[-1]
     selected_length = topk_blocks * block_size
 
+    strided_kv = _use_strided_qsa(queries, keys, values, cache, block_size, topk_blocks)
     queries = mx.contiguous(queries)
-    keys = mx.contiguous(keys)
-    values = mx.contiguous(values)
+    if not strided_kv:
+        keys = mx.contiguous(keys)
+        values = mx.contiguous(values)
     block_indices = mx.contiguous(mx.sort(block_indices.astype(mx.int32), axis=-1))
     query_ends = mx.contiguous(query_ends.astype(mx.int32))
     scale_array, key_length_array = _qsa_sparse_attention_scalars(
@@ -317,6 +402,7 @@ def qsa_sparse_attention(
         int(topk_blocks),
         int(q_heads),
         int(kv_heads),
+        strided_kv,
     )
     return kernel(
         inputs=[
@@ -383,6 +469,7 @@ def dispatch_qsa_attention(
             scale=scale,
             block_size=block_size,
             _plan=plan,
+            cache=cache,
         )
     if mask is None:
         mask = mask_factory()

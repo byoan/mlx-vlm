@@ -98,6 +98,16 @@ that head with a default ceiling of four total verification tokens (one seed
 plus up to three proposals). `--draft-block-size` overrides this ceiling;
 the best value depends on the prompt and hardware.
 
+Indexed QSA automatically avoids packing padded K/V cache prefixes on Apple
+M3 Ultra for single-request BF16 generation at 16,384 tokens and above. This
+applies to one- or two-token query windows with 24 query heads, 2 KV heads,
+256-wide heads, and 512 selected four-token blocks. The stride-aware kernel
+preserves the indexed attention calculation and reads the existing cache layout
+directly. Selection uses standard KV-cache capacity metadata without evaluating
+arrays. Short contexts, buffers without spare capacity, other cache
+implementations, and unqualified devices or layouts retain contiguous addressing.
+No additional environment setting is required.
+
 On Apple M3 Ultra, long-context QSA verification can use an exact sparse
 attention kernel by setting `MLX_VLM_QWEN4_EXACT_SPARSE_QSA=1`. The kernel is
 limited to the checkpoint's 24 query heads, 2 KV heads, and 256-wide BF16/FP16
