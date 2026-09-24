@@ -261,10 +261,11 @@ def _kernels(dtype, head_dim, q_heads, kv_heads):
     )
 
 
-@lru_cache(maxsize=1)
-def _topk_kernel():
+@lru_cache(maxsize=2)
+def _topk_kernel(runtime_length=False):
     return mx.fast.metal_kernel(
-        name="qwen4_exact_sparse_qsa_radix_topk",
+        name="qwen4_exact_sparse_qsa_radix_topk"
+        + ("_runtime" if runtime_length else ""),
         input_names=["scores"],
         output_names=["selected"],
         header="""
@@ -277,7 +278,8 @@ def _topk_kernel():
                     (as_type<uint>(max(value, 0.0f)) | 0x80000000u);
             }
         """,
-        source=_TOPK_SOURCE,
+        source=("const uint N = scores_shape[1];\n" if runtime_length else "")
+        + _TOPK_SOURCE,
     )
 
 
@@ -338,9 +340,16 @@ def select_blocks(scores, topk):
     ):
         return None
 
-    selected = _topk_kernel()(
+    # Decode and MTP verification visit a new block count every few tokens.
+    # Keep N out of their Metal specialization key; large prefill calls retain
+    # the existing static kernel and its performance characteristics.
+    runtime_length = rows <= 8
+    template = [("K", topk)]
+    if not runtime_length:
+        template.insert(0, ("N", blocks))
+    selected = _topk_kernel(runtime_length=runtime_length)(
         inputs=[mx.contiguous(scores.reshape(rows, blocks))],
-        template=[("N", blocks), ("K", topk)],
+        template=template,
         grid=(256, rows, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, topk)],

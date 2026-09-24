@@ -283,3 +283,13 @@ index without evaluating tensor offsets. The existing 16K context, dtype,
 geometry and spare-capacity checks still apply. Restored caches without visible
 spare capacity, custom cache updates and multiple active sequences retain the
 contiguous path. This covers the singleton cache layout used by `BatchGenerator`.
+
+### Runtime-length radix selection
+
+With `MLX_VLM_QWEN4_RADIX_QSA_TOPK=1`, eligible decode and MTP verification
+calls (up to eight query rows) read the block count at runtime. They reuse one
+Metal specialization as context grows, avoiding compilation for each new block
+count. The radix algorithm, ordered selected IDs, top-512 threshold and existing
+hardware/environment eligibility remain unchanged. Larger prefill calls keep
+the static-length kernel. This targets stalls on previously unseen long-context
+lengths, rather than increasing already-warmed steady-state throughput.
