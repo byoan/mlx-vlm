@@ -7,7 +7,7 @@ from typing import Callable, Optional
 import mlx.core as mx
 
 from ..base import scaled_dot_product_attention
-from ..cache import KVCache
+from ..cache import BatchKVCache, KVCache
 
 
 class QSAExecutionPlan(str, Enum):
@@ -249,6 +249,15 @@ def _use_strided_qsa(queries, keys, values, cache, block_size, topk_blocks):
     Unknown cache implementations and restored views with no visible spare
     capacity conservatively retain the contiguous path.
     """
+    update = getattr(type(cache), "update_and_fetch", None)
+    if update is KVCache.update_and_fetch:
+        length = cache.offset
+    elif update is BatchKVCache.update_and_fetch:
+        # offset is a per-row tensor; _idx is the physical prefix length.
+        # Reading it avoids a GPU synchronization and handles left padding.
+        length = cache._idx
+    else:
+        return False
     if (
         queries.shape[0] != 1
         or queries.shape[1] != 24
@@ -259,10 +268,10 @@ def _use_strided_qsa(queries, keys, values, cache, block_size, topk_blocks):
         or keys.shape[2] < _STRIDED_QSA_MIN_CONTEXT
         or block_size != 4
         or topk_blocks != 512
-        or getattr(type(cache), "update_and_fetch", None)
-        is not KVCache.update_and_fetch
-        or not isinstance(cache.offset, int)
-        or cache.offset != keys.shape[2]
+        or keys.shape[0] != 1
+        or values.shape[0] != 1
+        or not isinstance(length, int)
+        or length != keys.shape[2]
         or mx.default_device() != mx.gpu
         or not _strided_qsa_device_supported()
     ):

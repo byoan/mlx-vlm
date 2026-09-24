@@ -274,3 +274,12 @@ On M3 Ultra with the MXFP8 target and native MTP drafter, three interleaved
 decode throughput of 34.21 tokens/s without this option and 34.56 with it
 (about 1.0%). All six runs had identical tokens and acceptance traces. This
 is a decode measurement; it does not establish a cold-prefill speedup.
+
+### Singleton batch-cache QSA dispatch
+
+The stride-aware M3 Ultra QSA path also recognizes the standard `BatchKVCache`
+behind `BatchQSAKVCache` for one active sequence. It uses the physical prefix
+index without evaluating tensor offsets. The existing 16K context, dtype,
+geometry and spare-capacity checks still apply. Restored caches without visible
+spare capacity, custom cache updates and multiple active sequences retain the
+contiguous path. This covers the singleton cache layout used by `BatchGenerator`.

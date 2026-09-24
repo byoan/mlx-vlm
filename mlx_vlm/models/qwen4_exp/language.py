@@ -164,6 +164,12 @@ def _trim_qsa_blocks(cache, length):
         cache.clear_index_blocks()
 
 
+def _qsa_attention_storage(cache):
+    # Only unwrap the known wrapper: custom update implementations must retain
+    # the conservative contiguous path in the QSA layout guard.
+    return cache.kv_cache if type(cache) is BatchQSAKVCache else cache
+
+
 class QSAKVCache(KVCache):
     """KV cache with the raw indexer keys and multimodal positions used by QSA."""
 
@@ -1369,7 +1375,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             values,
             selection.selected_blocks,
             selection.query_ends,
-            cache=cache,
+            cache=_qsa_attention_storage(cache),
             scale=self.scale,
             block_size=self.indexer.compress_ratio,
             causal=standard_causal_mask,
@@ -2400,7 +2406,7 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
                 values,
                 selection.selected_blocks,
                 selection.query_ends,
-                cache=cache,
+                cache=_qsa_attention_storage(cache),
                 scale=attention.scale,
                 block_size=attention.indexer.compress_ratio,
                 causal=standard_causal,

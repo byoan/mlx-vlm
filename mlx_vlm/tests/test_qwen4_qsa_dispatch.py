@@ -3,9 +3,13 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.models.cache import KVCache
+from mlx_vlm.models.cache import BatchKVCache, KVCache
 from mlx_vlm.models.qwen4_exp import qsa_kernel as qsa
-from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+from mlx_vlm.models.qwen4_exp.language import (
+    BatchQSAKVCache,
+    QSAKVCache,
+    _qsa_attention_storage,
+)
 
 pytestmark = pytest.mark.skipif(
     not mx.metal.is_available(), reason="QSA kernels require Metal"
@@ -24,7 +28,8 @@ def inputs(cache, length, width=2):
     # for both queries; the incomplete causal tail is handled by the kernel.
     blocks = mx.broadcast_to(mx.arange(511, -1, -1, dtype=mx.int32), (1, width, 512))
     blocks = mx.where(blocks == 0, -1, blocks)
-    ends = mx.arange(cache.offset - width + 1, cache.offset + 1, dtype=mx.int32)[None]
+    length = cache._idx if isinstance(cache, BatchKVCache) else cache.offset
+    ends = mx.arange(length - width + 1, length + 1, dtype=mx.int32)[None]
     return query, keys, values, blocks, ends
 
 
@@ -123,3 +128,51 @@ def test_qsa_dispatch_crosses_threshold_after_rejection():
     cache.trim(5)
     assert_dispatch_exact(cache, inputs(cache, 2), False)  # back below cutoff
     assert_dispatch_exact(cache, inputs(cache, 2), True)
+
+
+@pytest.mark.parametrize(
+    "length,padding",
+    [(4096, 200), (16383, 200), (16384, 0), (16384, 200), (32808, 200)],
+)
+@pytest.mark.parametrize("width", [1, 2])
+def test_singleton_batch_cache_dispatch(length, padding, width):
+    wrapper = BatchQSAKVCache([0])
+    cache = _qsa_attention_storage(wrapper)
+    assert cache is wrapper.kv_cache
+    cache.step = length + padding
+    assert_dispatch_exact(
+        cache, inputs(cache, length, width), length >= 16384 and padding > 0
+    )
+
+
+def test_singleton_batch_cache_growth_trim_restore():
+    wrapper = BatchQSAKVCache([0])
+    cache = _qsa_attention_storage(wrapper)
+    assert_dispatch_exact(cache, inputs(cache, 16384), False)
+    assert_dispatch_exact(cache, inputs(cache, 4), True)
+    cache.trim(4)
+    assert_dispatch_exact(cache, inputs(cache, 2), True)
+    cache.state = cache.state
+    q, _, _, blocks, ends = inputs(KVCache(), 16386)
+    assert_dispatch_exact(cache, (q, cache.keys, cache.values, blocks, ends), False)
+    assert_dispatch_exact(cache, inputs(cache, 1), True)
+
+
+def test_batch_cache_unknown_updates_and_multiple_rows_fall_back():
+    class CustomWrapper(BatchQSAKVCache):
+        pass
+
+    class CustomStorage(BatchKVCache):
+        def update_and_fetch(self, *args):
+            return super().update_and_fetch(*args)
+
+    wrapper = CustomWrapper([0])
+    assert _qsa_attention_storage(wrapper) is wrapper
+    for cache in (wrapper, CustomStorage([0])):
+        q, k, v, _, _ = inputs(KVCache(), 16386)
+        assert not qsa._use_strided_qsa(q, k, v, cache, 4, 512)
+    cache = BatchKVCache([0, 0])
+    x = mx.zeros((2, 2, 16386, 256), dtype=mx.bfloat16)
+    k, v = cache.update_and_fetch(x, x)
+    q = mx.zeros((2, 24, 2, 256), dtype=mx.bfloat16)
+    assert not qsa._use_strided_qsa(q, k, v, cache, 4, 512)
