@@ -2261,23 +2261,25 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
             # QSA's two-position verifier matches sequential decode exactly;
             # keep wider blocks as ordered pairs. At the dense/sparse boundary,
             # each position must select the same attention path as decode.
-            return mx.concatenate(
-                [
-                    self._qsa_attention(
-                        attention,
-                        hidden_states[:, index : index + step],
-                        cache,
-                        (
-                            None
-                            if position_ids is None
-                            else position_ids[..., index : index + step]
-                        ),
-                        None,
-                    )
-                    for index in range(0, hidden_states.shape[1], step)
-                ],
-                axis=1,
-            )
+            parts = []
+            for index in range(0, hidden_states.shape[1], step):
+                part = self._qsa_attention(
+                    attention,
+                    hidden_states[:, index : index + step],
+                    cache,
+                    (
+                        None
+                        if position_ids is None
+                        else position_ids[..., index : index + step]
+                    ),
+                    None,
+                )
+                # Submit before the next cache append so pending attention
+                # graphs do not retain earlier KV buffers across all pairs.
+                # Keep execution asynchronous to avoid a host synchronization.
+                mx.async_eval(part)
+                parts.append(part)
+            return mx.concatenate(parts, axis=1)
         projected = self._linear(attention.indexer.index_qk_proj, hidden_states)
         if hidden_states.shape[1] > 2 or (
             isinstance(mask, str) and mask == "left_padded_decode"

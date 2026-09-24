@@ -1015,6 +1015,34 @@ def test_qwen4_speculative_verifier_matches_tokenwise_hidden_and_logits():
     ).item()
 
 
+@pytest.mark.parametrize("prefix_length", [8, 10, 17])
+@pytest.mark.parametrize("width", [3, 4, 8])
+def test_qwen4_sparse_verifier_submission_preserves_serial_results(
+    prefix_length, width
+):
+    # Cover dense attention, crossing the sparse threshold (12), and sparse
+    # attention, including an odd verifier width with a final single token.
+    language = _rollback_language()
+    prompt = mx.arange(2, 2 + prefix_length, dtype=mx.int32)[None]
+    block = mx.arange(3, 3 + width, dtype=mx.int32)[None]
+    actual, reference = language.make_cache(), language.make_cache()
+    language(prompt, cache=actual)
+    language(prompt, cache=reference)
+    hidden, _, _, logits = language.speculative_verify_logits(
+        block, actual, lambda values: values
+    )
+    serial_hidden, serial_logits = [], []
+    for index in range(width):
+        output = language(
+            block[:, index : index + 1], cache=reference, return_hidden=True
+        )
+        serial_hidden.append(output.hidden_states[-1])
+        serial_logits.append(output.logits)
+    assert mx.array_equal(hidden, mx.concatenate(serial_hidden, axis=1)).item()
+    assert mx.array_equal(logits, mx.concatenate(serial_logits, axis=1)).item()
+    _assert_cache_equal(actual, reference)
+
+
 def test_qwen4_fused_greedy_mixes_captured_hyper_state_before_lm_head(monkeypatch):
     from mlx_vlm.models.qwen4_exp import language as qwen4_language
 
