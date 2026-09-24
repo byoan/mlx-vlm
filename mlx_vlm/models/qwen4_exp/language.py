@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ...speculative.cache_state import start_speculative_cache
 from ..base import LanguageModelOutput
@@ -1494,6 +1495,28 @@ class ShardedEmbedding(nn.Module):
         # One tiny host sync avoids scheduling gathers against all 128 giant
         # PLE shards for every token.
         mx.eval(flat)
+        # Wide prefill batches otherwise scan every row once per active shard
+        # in Python. Keep the lightweight list path for decode/verification.
+        if flat.size > 128:
+            host_indices = np.asarray(flat)
+            offsets = np.asarray(self.shard_offsets)
+            if np.any(host_indices < 0) or np.any(host_indices >= offsets[-1]):
+                raise IndexError("embedding index is outside the sharded vocabulary")
+            shard_indices = np.searchsorted(offsets, host_indices, side="right") - 1
+            result = None
+            for shard_index in np.unique(shard_indices):
+                positions = np.flatnonzero(shard_indices == shard_index).astype(
+                    np.int32
+                )
+                local_indices = (host_indices[positions] - offsets[shard_index]).astype(
+                    np.int32
+                )
+                values = self.shards[int(shard_index)](mx.array(local_indices))
+                if result is None:
+                    result = mx.zeros((flat.size, self.dims), dtype=values.dtype)
+                result = result.at[mx.array(positions)].add(values)
+            return result.reshape(*indices.shape, self.dims)
+
         host_indices = [int(index) for index in flat.tolist()]
         if not host_indices:
             return self.shards[0](flat).reshape(*indices.shape, self.dims)
