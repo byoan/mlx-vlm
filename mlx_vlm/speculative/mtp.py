@@ -891,6 +891,7 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    max_tokens_per_row: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -904,6 +905,28 @@ def _mtp_rounds_batch(
     lm = model.language_model if hasattr(model, "language_model") else model
 
     B = first_bonus.shape[0]
+    if B > 1:
+        from .qwen4_batch import batch_limit, rounds
+
+        if batch_limit(lm, draft_model) > 1:
+            yield from rounds(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                first_bonus=first_bonus,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=token_dtype,
+                stop_check=stop_check,
+                eos_token_ids=eos_token_ids,
+                greedy_sampling=greedy_sampling,
+                row_ids=row_ids,
+                max_tokens_per_row=max_tokens_per_row,
+            )
+            return
+
     if callable(getattr(sampler, "speculative_accept", None)) and B != 1:
         raise ValueError("Sampled residual MTP requires one active sequence")
     row_ids = list(range(B)) if row_ids is None else list(row_ids)

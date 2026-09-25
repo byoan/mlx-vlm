@@ -56,6 +56,13 @@ class SampledMTPSampler:
             raise ValueError("Vocabulary must be positive")
         self.vocab_size = int(size)
 
+    def fork(self):
+        """A request-local stream with the same configured seed and vocabulary."""
+        child = type(self)(self.temperature, self.top_k, self.top_p, self.seed)
+        if self.vocab_size is not None:
+            child.set_vocabulary(self.vocab_size)
+        return child
+
     def reset_draft(self):
         self.proposals = []
         self._draft_draw = 0

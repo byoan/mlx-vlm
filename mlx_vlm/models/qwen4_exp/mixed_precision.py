@@ -132,7 +132,7 @@ def route_kernel():
 
 def route_pack(ids):
     ids = ids.reshape(-1).astype(mx.uint32)
-    if not 20 <= ids.size <= 80 or ids.size % 10:
+    if not 20 <= ids.size <= 320 or ids.size % 10:
         raise ValueError("Unsupported routed block")
     return route_kernel()(
         inputs=[ids],

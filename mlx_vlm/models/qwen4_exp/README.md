@@ -293,3 +293,31 @@ count. The radix algorithm, ordered selected IDs, top-512 threshold and existing
 hardware/environment eligibility remain unchanged. Larger prefill calls keep
 the static-length kernel. This targets stalls on previously unseen long-context
 lengths, rather than increasing already-warmed steady-state throughput.
+
+## Opt-in fixed-cohort MTP generation
+
+`MLX_VLM_QWEN4_MTP_BATCH_SIZE=2` allows `BatchGenerator` to admit up to two
+compatible dedicated Qwen4 MTP requests together. The default is `1`, retaining
+the existing singleton route. Set the generator's `completion_batch_size` and
+`prefill_batch_size` to at least the desired cohort size. Larger values are
+supported by grouping verification work into at most 32 token rows per kernel
+invocation; there is no hard-coded two-request limit.
+
+This path targets the dedicated `q3_top32_q8` drafter with unquantized target KV.
+Keep `mixed_q4_q8` and the existing optimization environment settings enabled.
+Each request owns its sampler, draft cache, target cache, accepted length and
+position. Mixed HC/MoE verification combines token-independent work; attention,
+GDN and PLE history stay request-local, preserving the existing stride-aware
+QSA, runtime-length radix, pooled-cache and rollback paths. Draft readout retains
+its optimized singleton implementation per request.
+
+Prefill uses each request's singleton chunk boundaries and APC lookup. Padded
+prefill can change Qwen4 hidden states and seeded continuations, so cohorts join
+at the generation boundary. All cohort members therefore wait for cohort
+prefill to finish before generation starts. The intended benefit is aggregate
+throughput, not improved per-request decode latency.
+
+This is fixed-cohort batching: new arrivals wait while a speculative cohort is
+active. Different sampling configurations continue to follow the serving
+owner's compatibility grouping. Adding requests to an active cohort and batching
+the draft readout itself are separate future optimizations.

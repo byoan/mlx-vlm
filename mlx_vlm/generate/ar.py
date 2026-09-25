@@ -1118,7 +1118,7 @@ def _limit_sampler_vocab(sampler, vocab_size: Optional[int]):
     configure_vocab = getattr(sampler, "set_vocabulary", None)
     if callable(configure_vocab):
         configure_vocab(vocab_size)
-    for name in ("sample_draft", "speculative_accept", "reset_draft"):
+    for name in ("sample_draft", "speculative_accept", "reset_draft", "fork"):
         method = getattr(sampler, name, None)
         if callable(method):
             setattr(wrapped, name, method)
@@ -1726,6 +1726,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            max_tokens_per_row=self.max_tokens,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -2551,8 +2552,12 @@ class BatchGenerator:
             from ..speculative.sampled_mtp import prepare_mtp_sampler
 
             sampler = prepare_mtp_sampler(draft_model, sampler, self.greedy_sampling)
-            # This drafter's readout and retained-q verifier are singleton paths.
-            completion_batch_size = prefill_batch_size = 1
+            # Dedicated Qwen4 batching is opt-in; other drafters retain their limit.
+            from ..speculative.qwen4_batch import batch_limit
+
+            limit = batch_limit(model, draft_model)
+            completion_batch_size = min(completion_batch_size, limit)
+            prefill_batch_size = min(prefill_batch_size, limit)
             if any(self.logits_processors):
                 raise ValueError(
                     "Qwen4 two-stage MTP does not support logits processors"
@@ -3015,6 +3020,12 @@ class BatchGenerator:
 
             # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
+                remove = getattr(self._prompt_batch, "remove", None)
+                if callable(remove):
+                    remove(uid)
+                    if not self._prompt_batch.uids:
+                        self._prompt_batch = None
+                    return True
                 if len(self._prompt_batch.uids) == 1:
                     self._prompt_batch.uids = []
                     self._prompt_batch.prompt_cache = []
@@ -3076,6 +3087,54 @@ class BatchGenerator:
         if callable(progress):
             return progress()
         return []
+
+    def _build_cold_prompt_batch(self, sequences):
+        uids = [s[0] for s in sequences]
+        input_ids = [s[1] for s in sequences]
+        max_tokens_list = [s[2] for s in sequences]
+        prompt_kwargs_list = [s[3] for s in sequences]
+        logits_processors = [s[4] for s in sequences]
+        thinking_budget_criteria = [s[5] for s in sequences]
+
+        inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
+            prompt_kwargs_list, input_ids
+        )
+
+        # APC: also harvest cold-prefill prefixes so future requests hit.
+        apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
+
+        prompt_batch_cls = _generate_module_override(
+            "PromptProcessingBatch", PromptProcessingBatch
+        )
+        return prompt_batch_cls(
+            model=self.model,
+            uids=uids,
+            input_ids=input_ids,
+            max_tokens=max_tokens_list,
+            inputs_embeds=inputs_embeds,
+            prompt_kwargs=merged_kwargs,
+            logits_processors=logits_processors,
+            thinking_budget_criteria=thinking_budget_criteria,
+            prefill_step_size=self.prefill_step_size,
+            kv_bits=self.kv_bits,
+            kv_key_bits=getattr(self, "kv_key_bits", None),
+            kv_value_bits=getattr(self, "kv_value_bits", None),
+            kv_key_scheme=getattr(self, "kv_key_scheme", None),
+            kv_value_scheme=getattr(self, "kv_value_scheme", None),
+            kv_group_size=self.kv_group_size,
+            kv_quant_scheme=self.kv_quant_scheme,
+            quantized_kv_start=getattr(
+                self, "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
+            ),
+            apc_meta=apc_meta,
+            apc_manager=self.apc_manager,
+            apc_coordinator=getattr(self, "apc", None),
+            apc_mode=self.apc_mode,
+            draft_model=getattr(self, "draft_model", None),
+            draft_kind=getattr(self, "draft_kind", None),
+            draft_block_size=getattr(self, "draft_block_size", None),
+            greedy_sampling=getattr(self, "greedy_sampling", False),
+        )
 
     def _extend_generation_batch(self, gen_batch) -> None:
         if len(self._generation_batch) == 0:
@@ -3165,7 +3224,17 @@ class BatchGenerator:
                     n,
                     len(self._unprocessed_sequences),
                 )
-            mixed = self._build_mixed_prompt_batch(sequences)
+            from ..speculative.qwen4_batch import batch_limit
+
+            if (
+                len(sequences) > 1
+                and batch_limit(self.model, getattr(self, "draft_model", None)) > 1
+            ):
+                from ..speculative.qwen4_batch import CohortPromptBatch
+
+                mixed = CohortPromptBatch(self, sequences)
+            else:
+                mixed = self._build_mixed_prompt_batch(sequences)
             if mixed is not None:
                 self._unprocessed_sequences = self._unprocessed_sequences[n:]
                 self._prompt_batch = mixed
@@ -3195,52 +3264,7 @@ class BatchGenerator:
 
             self._unprocessed_sequences = self._unprocessed_sequences[n:]
 
-            uids = [s[0] for s in sequences]
-            input_ids = [s[1] for s in sequences]
-            max_tokens_list = [s[2] for s in sequences]
-            prompt_kwargs_list = [s[3] for s in sequences]
-            logits_processors = [s[4] for s in sequences]
-            thinking_budget_criteria = [s[5] for s in sequences]
-
-            inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
-                prompt_kwargs_list, input_ids
-            )
-
-            # APC: also harvest cold-prefill prefixes so future requests hit.
-            apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
-
-            prompt_batch_cls = _generate_module_override(
-                "PromptProcessingBatch", PromptProcessingBatch
-            )
-            self._prompt_batch = prompt_batch_cls(
-                model=self.model,
-                uids=uids,
-                input_ids=input_ids,
-                max_tokens=max_tokens_list,
-                inputs_embeds=inputs_embeds,
-                prompt_kwargs=merged_kwargs,
-                logits_processors=logits_processors,
-                thinking_budget_criteria=thinking_budget_criteria,
-                prefill_step_size=self.prefill_step_size,
-                kv_bits=self.kv_bits,
-                kv_key_bits=getattr(self, "kv_key_bits", None),
-                kv_value_bits=getattr(self, "kv_value_bits", None),
-                kv_key_scheme=getattr(self, "kv_key_scheme", None),
-                kv_value_scheme=getattr(self, "kv_value_scheme", None),
-                kv_group_size=self.kv_group_size,
-                kv_quant_scheme=self.kv_quant_scheme,
-                quantized_kv_start=getattr(
-                    self, "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
-                ),
-                apc_meta=apc_meta,
-                apc_manager=self.apc_manager,
-                apc_coordinator=getattr(self, "apc", None),
-                apc_mode=self.apc_mode,
-                draft_model=getattr(self, "draft_model", None),
-                draft_kind=getattr(self, "draft_kind", None),
-                draft_block_size=getattr(self, "draft_block_size", None),
-                greedy_sampling=getattr(self, "greedy_sampling", False),
-            )
+            self._prompt_batch = self._build_cold_prompt_batch(sequences)
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
             if self._prompt_batch.needs_processing():
