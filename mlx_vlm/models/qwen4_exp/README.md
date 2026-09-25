@@ -321,3 +321,8 @@ This is fixed-cohort batching: new arrivals wait while a speculative cohort is
 active. Different sampling configurations continue to follow the serving
 owner's compatibility grouping. Adding requests to an active cohort and batching
 the draft readout itself are separate future optimizations.
+
+## Batched MTP serving
+
+See [batched and continuous MTP](BATCHED_MTP.md) for opt-in admission, batched
+draft heads, native temporal kernels, eligibility limits and prefill experiments.

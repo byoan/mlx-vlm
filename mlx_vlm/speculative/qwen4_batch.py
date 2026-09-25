@@ -1,4 +1,4 @@
-"""Opt-in fixed-cohort MTP with independent request state and shared verification."""
+"""Opt-in cohort and continuous MTP with request-owned state and shared compute."""
 
 import copy
 import os
@@ -27,6 +27,13 @@ def batch_limit(model, drafter):
     ):
         return 1
     return limit
+
+
+def continuous(model, drafter):
+    return (
+        os.environ.get("MLX_VLM_QWEN4_CONTINUOUS_MTP", "0") == "1"
+        and batch_limit(model, drafter) > 1
+    )
 
 
 @dataclass
@@ -61,6 +68,8 @@ def rounds(
     greedy_sampling=False,
     row_ids=None,
     max_tokens_per_row=None,
+    admissions=None,
+    rope_deltas=None,
 ):
     from ..models.qwen4_exp.batched_verifier import RowCaches, verify_requests
     from .common import (
@@ -96,7 +105,9 @@ def rounds(
     row_ids = list(range(batch)) if row_ids is None else list(row_ids)
     if len(row_ids) != batch:
         raise ValueError("Expected one sampling row ID per request")
-    deltas = getattr(lm, "_rope_deltas", None)
+    deltas = (
+        rope_deltas if rope_deltas is not None else getattr(lm, "_rope_deltas", None)
+    )
     deltas = [0] * batch if deltas is None else deltas.reshape(-1).tolist()
     if len(deltas) == 1:
         deltas *= batch
@@ -107,27 +118,40 @@ def rounds(
     )
     if len(limits) != batch or any(n < 1 or n > max_tokens for n in limits):
         raise ValueError("Invalid per-request token limits")
-    states = []
-    for i in range(batch):
+
+    def make_state(i, row_id, cache, h, token, delta, limit, sample):
         draft = copy.copy(draft_model)
         draft.reset(lm)
-        child_sampler = sampler if greedy_sampling else sampler.fork()
-        offset = caches[i][lm.model.fa_idx].offset
+        child_sampler = sample if greedy_sampling else sample.fork()
+        offset = cache[lm.model.fa_idx].offset
         draft.set_shared_kv({}, offset, kv_valid_len=offset)
-        states.append(
-            _Request(
-                i,
-                row_ids[i],
-                draft,
-                child_sampler,
-                caches[i],
-                _mtp_draft_hidden(lm, hidden[i : i + 1, -1:]),
-                int(bonus[i]),
-                offset,
-                int(deltas[i]),
-                limit=limits[i],
-            )
+        return _Request(
+            i,
+            row_id,
+            draft,
+            child_sampler,
+            cache,
+            _mtp_draft_hidden(lm, h[:, -1:]),
+            int(token),
+            offset,
+            int(delta),
+            limit=limit,
         )
+
+    states = [
+        make_state(
+            i,
+            row_ids[i],
+            caches[i],
+            hidden[i : i + 1],
+            bonus[i],
+            deltas[i],
+            limits[i],
+            sampler,
+        )
+        for i in range(batch)
+    ]
+    del caches
     draft_model.accept_lens = []
     draft_model.draft_lens = []
     draft_model.batch_accept_lens = [s.draft.accept_lens for s in states]
@@ -135,6 +159,30 @@ def rounds(
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured = int(getattr(draft_model.config, "block_size", block_total))
     while True:
+        # Admissions are only consumed between complete speculative rounds.
+        # Every accepted prefix has been committed before control returns to
+        # the server, so prefill can run without reopening a transaction.
+        if admissions:
+            incoming = list(admissions)
+            admissions.clear()
+            for entry in incoming:
+                entry = dict(entry)
+                i = entry.pop("slot")
+                state = make_state(i, **entry)
+                if i == len(states):
+                    states.append(state)
+                    for bank, cache in zip(prompt_cache, state.cache):
+                        bank.rows.append(cache)
+                    draft_model.batch_accept_lens.append(state.draft.accept_lens)
+                    draft_model.batch_draft_lens.append(state.draft.draft_lens)
+                else:
+                    states[i] = state
+                    for bank, cache in zip(prompt_cache, state.cache):
+                        bank.rows[i] = cache
+                    draft_model.batch_accept_lens[i] = state.draft.accept_lens
+                    draft_model.batch_draft_lens[i] = state.draft.draft_lens
+            batch = len(states)
+            del incoming, entry, state
         active = []
         for s in states:
             if (
@@ -145,8 +193,19 @@ def rounds(
                 s.finished = True
             if not s.finished:
                 active.append(s)
+            elif admissions is not None and s.cache:
+                for bank in prompt_cache:
+                    bank.rows[s.index] = None
+                s.cache = []
+                s.hidden = None
+                s.draft._cache = []
+                s.draft._seed_token = s.draft._seed_hidden = None
+                s.sampler = None
         if not active:
             return
+        from .drafters.qwen4_exp_mtp.batch import mode, draft_blocks, accept_batch
+
+        batched_draft = len(active) > 1 and mode() != "off" and not greedy_sampling
         groups = defaultdict(list)
         for s in active:
             width = _mtp_next_block_size(
@@ -154,6 +213,9 @@ def rounds(
             )
             if width <= 1:
                 s.finished = True
+                continue
+            if batched_draft:
+                groups[width].append((s, None))
                 continue
             with mx.stream(generation_stream):
                 proposals = s.draft.draft_block(
@@ -169,6 +231,13 @@ def rounds(
             groups[width].append((s, proposals))
         outputs = {}
         for width, group in groups.items():
+            if batched_draft:
+                with mx.stream(generation_stream):
+                    proposals = draft_blocks([s for s, _ in group], width, token_dtype)
+                    mx.async_eval(
+                        proposals, [s.draft.draft_eval_state() for s, _ in group]
+                    )
+                group = [(s, p) for (s, _), p in zip(group, proposals)]
             # Scale beyond B=2 without exceeding the Metal route-pack scratch.
             group_size = max(1, 32 // width)
             for start in range(0, len(group), group_size):
@@ -191,6 +260,7 @@ def rounds(
                             [s.cache for s, _ in chunk],
                             [s.rope_delta for s, _ in chunk],
                         )
+                    draft_jobs = []
                     for i, (s, proposals) in enumerate(chunk):
                         h = verified[i : i + 1]
                         result = _MTPVerifyResult(h, {}, rollback_state=transactions[i])
@@ -214,23 +284,34 @@ def rounds(
                         accepted = min(accepted, max(0, len(tokens) - 1))
                         _record_speculative_round(s.draft, accepted, width - 1)
                         _record_speculative_round(draft_model, accepted, width - 1)
-                        with mx.stream(generation_stream):
-                            s.draft.accept_verified_tokens(
-                                h,
-                                proposals,
-                                accepted,
-                                tokens,
-                                s.sampler,
-                                token_dtype,
-                                **_mtp_draft_kwargs(
-                                    s.draft, greedy_sampling, s.sampler
-                                ),
-                            )
+                        if admissions is not None:
+                            # Lifetime counters stay monotonic; diagnostic history
+                            # must not grow without bound on a busy server.
+                            del draft_model.accept_lens[:-4096]
+                            del draft_model.draft_lens[:-4096]
+                        if batched_draft:
+                            draft_jobs.append((s, h, proposals, accepted, tokens))
+                        else:
+                            with mx.stream(generation_stream):
+                                s.draft.accept_verified_tokens(
+                                    h,
+                                    proposals,
+                                    accepted,
+                                    tokens,
+                                    s.sampler,
+                                    token_dtype,
+                                    **_mtp_draft_kwargs(
+                                        s.draft, greedy_sampling, s.sampler
+                                    ),
+                                )
                         result.commit(lm, s.cache, accepted, width)
                         s.hidden = _mtp_draft_hidden(lm, h[:, accepted : accepted + 1])
                         s.offset += accepted + 1
                         s.draft.set_shared_kv({}, s.offset, kv_valid_len=s.offset)
                         outputs[s.index] = tokens
+                    if draft_jobs:
+                        with mx.stream(generation_stream):
+                            accept_batch(draft_jobs, token_dtype)
                 except BaseException:
                     for transaction in transactions:
                         transaction.abort()
@@ -275,6 +356,7 @@ class CohortPromptBatch:
         self.rope_deltas = []
         self.index = 0
         self._timed_child = None
+        self._cursor = 0
         self.total_prompt_tokens = sum(c.total_prompt_tokens for c in self.children)
 
     def __len__(self):
@@ -284,6 +366,23 @@ class CohortPromptBatch:
         return self.index < len(self.children)
 
     def prompt_step(self):
+        dynamic = continuous(self.owner.model, self.owner.draft_model)
+        if dynamic and any(not c.needs_processing() for c in self.children):
+            return 0  # Let the scheduler admit completed prompts immediately.
+        if os.environ.get("MLX_VLM_QWEN4_BATCHED_PREFILL", "0") == "1":
+            from ..models.qwen4_exp.batched_prefill import supported, step
+
+            ready = [c for c in self.children[self.index :] if c.needs_processing()]
+            if supported(self.owner, ready):
+                result = step(self.owner, ready)
+                if result is not None:
+                    self._timed_child = ready
+                    return result
+        if dynamic:
+            child = self.children[self._cursor % len(self.children)]
+            self._cursor += 1
+            self._timed_child = child
+            return child.prompt_step()
         child = self.children[self.index]
         self._timed_child = child
         if child.needs_processing():
@@ -304,7 +403,10 @@ class CohortPromptBatch:
         return 0
 
     def record_prompt_time(self, elapsed):
-        if self._timed_child is not None:
+        if isinstance(self._timed_child, list):
+            for child in self._timed_child:
+                child.record_prompt_time(elapsed)
+        elif self._timed_child is not None:
             self._timed_child.record_prompt_time(elapsed)
 
     def prompt_progress(self):
@@ -320,15 +422,54 @@ class CohortPromptBatch:
             self.rope_deltas.pop(index)
             self.index -= 1
 
+    def drain_ready(self):
+        """Return finished prefills without waiting for longer cohort members."""
+        if not continuous(self.owner.model, self.owner.draft_model):
+            return None, []
+        import time
+
+        rows, deltas, progress, keep = [], [], [], []
+        for child in self.children:
+            if child.needs_processing():
+                keep.append(child)
+                continue
+            start = time.perf_counter()
+            row = child.generate(
+                self.owner.sampler,
+                self.owner.tokenizer.stopping_criteria,
+                compute_logprobs=False,
+                top_logprobs_k=0,
+            )
+            elapsed = time.perf_counter() - start
+            child.record_prompt_time(elapsed)
+            self.owner._prompt_time_counter += elapsed
+            rows.append(row)
+            delta = row._admission_rope_deltas
+            deltas.append(0 if delta is None else delta[0])
+            progress.extend(child.prompt_progress())
+        if not rows:
+            return None, []
+        self.children = keep
+        self.uids = [uid for child in keep for uid in child.uids]
+        self.index = 0
+        return (
+            self._join(
+                rows, deltas, self.owner.sampler, self.owner.tokenizer.stopping_criteria
+            ),
+            progress,
+        )
+
     def generate(self, sampler, stop_criteria, **kwargs):
+        if self.needs_processing():
+            raise RuntimeError("Cohort prefill is incomplete")
+        return self._join(self.completed, self.rope_deltas, sampler, stop_criteria)
+
+    def _join(self, rows, deltas, sampler, stop_criteria):
         from ..generate.ar import SpeculativeGenerationBatch
         from ..models.qwen4_exp.batched_verifier import RowCaches
 
-        if self.needs_processing():
-            raise RuntimeError("Cohort prefill is incomplete")
-        rows = self.completed
         lm = getattr(self.owner.model, "language_model", self.owner.model)
-        lm._rope_deltas = mx.array(self.rope_deltas)[:, None]
+        lm._rope_deltas = mx.array(deltas)[:, None]
         # Cancellation can leave a singleton: preserve its ordinary cache and
         # generation path instead of handing row banks to the singleton loop.
         if len(rows) == 1:

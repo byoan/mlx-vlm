@@ -5,6 +5,7 @@ constexpr uint SIMD_SIZE  = 32;
 constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
 constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
 
+uint row = threadgroup_position_in_grid.y;
 uint tid  = thread_position_in_threadgroup.x;
 uint lane = thread_index_in_simdgroup;
 uint sg   = simdgroup_index_in_threadgroup;
@@ -13,8 +14,8 @@ uint ord[PER_THREAD];
 uint idx[PER_THREAD];
 for (uint t = 0; t < PER_THREAD; ++t) {
     uint p = t * TG_SIZE + tid;
-    ord[t] = cand_ord[p];
-    idx[t] = cand_idx[p];
+    ord[t] = cand_ord[row * 2048 + p];
+    idx[t] = cand_idx[row * 2048 + p];
 }
 
 threadgroup uint sc_ord[NSIMD * TOPK];
@@ -63,6 +64,6 @@ if (sg == 0) {
         if (bs != 0xFFFFFFFFu && bo == mo && bi == mi) {
             tk2 |= (1u << bs);
         }
-        if (lane == 0) { token_ids[TOPK - 1u - r] = mi; }
+        if (lane == 0) { token_ids[row * TOPK + TOPK - 1u - r] = mi; }
     }
 }

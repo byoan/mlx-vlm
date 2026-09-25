@@ -1644,6 +1644,17 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        self._admissions = []
+        self._pending_first = []
+        lm = getattr(model, "language_model", model)
+        self._admission_rope_deltas = getattr(lm, "_rope_deltas", None)
+        if self._admission_rope_deltas is not None:
+            self._admission_rope_deltas = self._admission_rope_deltas.reshape(
+                -1
+            ).tolist()
+        from ..speculative.qwen4_batch import continuous
+
+        self.supports_admission = draft_kind == "mtp" and continuous(model, draft_model)
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1657,17 +1668,87 @@ class SpeculativeGenerationBatch:
         if len(self) == 0:
             self.__dict__.update(other.__dict__)
             return
-        raise RuntimeError("Cannot extend an active speculative generation batch.")
+        if not self.supports_admission or not other.supports_admission:
+            raise RuntimeError("Cannot extend an active speculative generation batch.")
+        if (
+            self.model is not other.model
+            or self.draft_model is not other.draft_model
+            or self.sampler is not other.sampler
+            or self.greedy_sampling != other.greedy_sampling
+            or self.draft_block_size != other.draft_block_size
+            or other._sent_first
+        ):
+            raise ValueError("Incompatible Qwen4 MTP admission")
+        from ..speculative.qwen4_batch import batch_limit
+
+        if len(self) + len(other) > batch_limit(self.model, self.draft_model):
+            raise ValueError("Admission exceeds Qwen4 MTP batch limit")
+        if not self._sent_first:
+            raise RuntimeError("Emit the initial tokens before extending an MTP batch")
+        # Capture the original prefill arrays before extending response metadata.
+        self._start_rounds()
+        lm = getattr(self.model, "language_model", self.model)
+        deltas = getattr(other, "_admission_rope_deltas", None)
+        if deltas is None:
+            value = getattr(lm, "_rope_deltas", None)
+            deltas = (
+                [0] * len(other._all_uids)
+                if value is None
+                else value.reshape(-1).tolist()
+            )
+        if len(deltas) == 1:
+            deltas *= len(other._all_uids)
+        if len(deltas) != len(other._all_uids):
+            raise ValueError("Expected one RoPE delta per admitted request")
+        for i, uid in enumerate(other._all_uids):
+            if other._finished[i]:
+                continue
+            row = next(
+                (j for j, done in enumerate(self._finished) if done),
+                len(self._all_uids),
+            )
+            token = int(other.first_tokens[i].item())
+            self._admissions.append(
+                dict(
+                    slot=row,
+                    row_id=0,
+                    cache=[c.extract(i) for c in other.prompt_cache],
+                    h=other.hidden[i : i + 1],
+                    token=token,
+                    delta=deltas[i],
+                    limit=other.max_tokens[i],
+                    sample=other.sampler,
+                )
+            )
+            if row == len(self._all_uids):
+                self._all_uids.append(uid)
+                self._num_tokens.append(0)
+                self._finished.append(False)
+                self.max_tokens.append(other.max_tokens[i])
+            else:
+                self._all_uids[row] = uid
+                self._num_tokens[row] = 0
+                self._finished[row] = False
+                self.max_tokens[row] = other.max_tokens[i]
+            self._pending_first.append((row, token))
+        self._refresh_uids()
 
     def filter(self, keep: List[int]):
         keep_uids = {self.uids[idx] for idx in keep}
         for i, uid in enumerate(self._all_uids):
             if uid not in keep_uids:
                 self._finished[i] = True
+        self._pending_first = [
+            (i, token) for i, token in self._pending_first if not self._finished[i]
+        ]
+        # Keep admission placeholders until the engine consumes them; a later
+        # replacement for the same slot supersedes their cache and sampler.
         self._refresh_uids()
 
     def cache_states(self):
-        return [c.state for c in self.prompt_cache if hasattr(c, "state")]
+        return [c.state for c in self.prompt_cache if hasattr(c, "state")] + [
+            c.state for entry in self._admissions for c in entry["cache"]
+        ]
 
     def _finish_reason(self, row: int, token: int) -> Optional[str]:
         if self.stop_criteria(token):
@@ -1709,6 +1790,32 @@ class SpeculativeGenerationBatch:
                 or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
             )
 
+        if self.supports_admission:
+            from ..speculative.qwen4_batch import rounds
+
+            self._rounds_iter = rounds(
+                self.model,
+                self.draft_model,
+                self.prompt_cache,
+                self.hidden,
+                first_bonus=self.first_tokens,
+                max_tokens=max(self.max_tokens),
+                sampler=self.sampler,
+                draft_block_size=self.draft_block_size,
+                token_dtype=self.token_dtype,
+                stop_check=stop_check,
+                greedy_sampling=self.greedy_sampling,
+                row_ids=[0] * len(self.first_tokens),
+                max_tokens_per_row=list(self.max_tokens),
+                admissions=self._admissions,
+                rope_deltas=(
+                    None
+                    if self._admission_rope_deltas is None
+                    else mx.array(self._admission_rope_deltas)
+                ),
+            )
+            return
+
         self._rounds_iter = run_speculative_server_rounds(
             self.model,
             self.draft_model,
@@ -1730,11 +1837,22 @@ class SpeculativeGenerationBatch:
         )
 
     def next(self) -> List[GenerationBatch.Response]:
+        self._just_emitted_first = False
         if len(self) == 0:
             return []
 
         responses: List[GenerationBatch.Response] = []
+        if self._pending_first:
+            self._just_emitted_first = True
+            tokens = [None] * len(self._all_uids)
+            for row, token in self._pending_first:
+                tokens[row] = token
+            self._pending_first.clear()
+            self._append_token_responses(responses, tokens)
+            self._refresh_uids()
+            return responses
         if not self._sent_first:
+            self._just_emitted_first = True
             self._sent_first = True
             mx.eval(self.first_tokens)
             for row, token in enumerate(self.first_tokens.tolist()):
@@ -2128,8 +2246,8 @@ class PromptProcessingBatch:
             out[k] = _slice_sequence_aligned_prompt_kwarg(k, out[k], stop=n)
         return out
 
-    def prompt_step(self) -> int:
-        """Process one chunk of the prompt. Returns tokens processed."""
+    def prepare_prompt_step(self):
+        """Prepare a chunk without mutating caches or advancing the prompt."""
         if not self.needs_processing():
             return 0
 
@@ -2138,7 +2256,6 @@ class PromptProcessingBatch:
         # Finish shorter right-padded rows at a chunk boundary so we can keep
         # their last real token's logits before subsequent chunks consume pad.
         # Some models only return the final column's logits during prefill.
-        finished_rows = []
         if self._right_pad_per_row is not None:
             start = self._processed_prompt_columns
             pending_ends = [length for length in self._suffix_lens if length > start]
@@ -2153,13 +2270,11 @@ class PromptProcessingBatch:
             **self._prompt_kwargs_for_step(n),
             **self._speculative_prefill.kwargs,
         }
-        output = self.model(
-            self._input_ids[:, :n],
-            cache=self.prompt_cache,
-            inputs_embeds=self._inputs_embeds[:, :n],
-            n_to_process=n,
-            **prompt_kwargs,
-        )
+        return n, prompt_kwargs
+
+    def finish_prompt_step(self, n, output):
+        """Commit bookkeeping after a successful model prefill call."""
+        finished_rows = []
         self._speculative_prefill.append(output)
         if self._right_pad_per_row is not None:
             end = self._processed_prompt_columns + n
@@ -2186,8 +2301,23 @@ class PromptProcessingBatch:
             self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
                 k, self._prompt_kwargs[k], start=n
             )
-        mx.clear_cache()
         return n
+
+    def prompt_step(self) -> int:
+        prepared = self.prepare_prompt_step()
+        if not prepared:
+            return 0
+        n, prompt_kwargs = prepared
+        output = self.model(
+            self._input_ids[:, :n],
+            cache=self.prompt_cache,
+            inputs_embeds=self._inputs_embeds[:, :n],
+            n_to_process=n,
+            **prompt_kwargs,
+        )
+        result = self.finish_prompt_step(n, output)
+        mx.clear_cache()
+        return result
 
     def record_prompt_time(self, elapsed_s: float) -> None:
         self._prompt_time_s += max(0.0, float(elapsed_s))
@@ -3142,6 +3272,17 @@ class BatchGenerator:
         else:
             self._generation_batch.extend(gen_batch)
 
+    def _drain_prefill_ready(self):
+        drain = getattr(self._prompt_batch, "drain_ready", None)
+        if drain is None:
+            return []
+        batch, progress = drain()
+        if batch is not None:
+            self._extend_generation_batch(batch)
+            if not len(self._prompt_batch):
+                self._prompt_batch = None
+        return progress
+
     def _next(self, **kwargs):
         generation_responses = []
         prompt_responses = []
@@ -3166,11 +3307,17 @@ class BatchGenerator:
                 else:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
-            if yield_after_decode:
+            if yield_after_decode or (
+                getattr(self._generation_batch, "supports_admission", False)
+                and getattr(self._generation_batch, "_just_emitted_first", False)
+            ):
+                # Deliver first tokens promptly. Do not admit another one-token
+                # request until the existing decoders get their next round.
                 return prompt_responses, generation_responses
 
         if (
             getattr(self._generation_batch, "is_speculative", False)
+            and not getattr(self._generation_batch, "supports_admission", False)
             and len(self._generation_batch) > 0
         ):
             return prompt_responses, generation_responses
@@ -3185,6 +3332,7 @@ class BatchGenerator:
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                prompt_responses.extend(self._drain_prefill_ready())
                 return prompt_responses, generation_responses
 
             tic = time.perf_counter()
@@ -3205,12 +3353,17 @@ class BatchGenerator:
 
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
-        if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
+        dynamic_mtp = getattr(self._generation_batch, "supports_admission", False)
+        if self._unprocessed_sequences and (
+            num_to_add >= self.prefill_batch_size or dynamic_mtp and num_to_add > 0
+        ):
             # Take up to prefill_batch_size pending sequences. If APC is on
             # and at least one of them has a prefix hit, build a mixed
             # warm/cold PromptProcessingBatch with right-padded suffixes so
             # warm and cold rows prefill in a single forward pass.
-            n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
+            n = min(
+                self.prefill_batch_size, num_to_add, len(self._unprocessed_sequences)
+            )
             sequences = self._unprocessed_sequences[:n]
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
@@ -3245,6 +3398,7 @@ class BatchGenerator:
                     elapsed = time.perf_counter() - tic
                     self._prompt_time_counter += elapsed
                     self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                    prompt_responses.extend(self._drain_prefill_ready())
                 else:
                     tic = time.perf_counter()
                     gen_batch = self._prompt_batch.generate(
@@ -3273,6 +3427,7 @@ class BatchGenerator:
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                prompt_responses.extend(self._drain_prefill_ready())
             else:
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(

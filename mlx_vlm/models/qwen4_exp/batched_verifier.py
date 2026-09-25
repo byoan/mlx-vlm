@@ -1,8 +1,10 @@
 """Shared token-local verification with independent, unpadded request caches.
 
-Only token-local operations see the flattened batch. Attention and temporal
-operations retain the qualified singleton kernels and cache transactions.
+Token-local operations share the flattened batch. Qualified temporal kernels
+read request-owned caches directly; unsupported calls retain singleton kernels.
 """
+
+import os
 
 import mlx.core as mx
 
@@ -18,14 +20,14 @@ class RowCaches:
 
     @property
     def state(self):
-        return [c.state for c in self.rows]
+        return [c.state for c in self.rows if c is not None]
 
     def extract(self, index):
         return self.rows[index]
 
     @property
     def nbytes(self):
-        return sum(c.nbytes for c in self.rows)
+        return sum(c.nbytes for c in self.rows if c is not None)
 
 
 class _IndependentTemporalRows:
@@ -52,12 +54,63 @@ class _IndependentTemporalRows:
         )
 
     def _gated_delta(self, layer, x, mask, cache):
+        if (
+            isinstance(cache, RowCaches)
+            and os.environ.get("MLX_VLM_QWEN4_BATCHED_GDN", "0") == "1"
+        ):
+            if len(cache.rows) > 4:
+                width = x.shape[1] // len(cache.rows)
+                return mx.concatenate(
+                    [
+                        self._gated_delta(
+                            layer,
+                            x[:, i * width : (i + 4) * width],
+                            mask,
+                            RowCaches(cache.rows[i : i + 4]),
+                        )
+                        for i in range(0, len(cache.rows), 4)
+                    ],
+                    axis=1,
+                )
+            from .batched_gdn import forward
+
+            result = forward(self, layer, x, cache)
+            if result is not None:
+                return result
         parent = super()._gated_delta
         return self._rows(
             x, cache, lambda row, c, start, width: parent(layer, row, None, c)
         )
 
     def _qsa_attention(self, attention, x, cache, positions, mask):
+        if (
+            isinstance(cache, RowCaches)
+            and os.environ.get("MLX_VLM_QWEN4_BATCHED_QSA", "0") == "1"
+        ):
+            if len(cache.rows) > 4:
+                width = x.shape[1] // len(cache.rows)
+                return mx.concatenate(
+                    [
+                        self._qsa_attention(
+                            attention,
+                            x[:, i * width : (i + 4) * width],
+                            RowCaches(cache.rows[i : i + 4]),
+                            (
+                                None
+                                if positions is None
+                                else positions[..., i * width : (i + 4) * width]
+                            ),
+                            mask,
+                        )
+                        for i in range(0, len(cache.rows), 4)
+                    ],
+                    axis=1,
+                )
+            from .batched_qsa import forward
+
+            result = forward(self, attention, x, cache, positions)
+            if result is not None:
+                return result
         parent = super()._qsa_attention
         if not isinstance(cache, RowCaches):
             return parent(attention, x, cache, positions, mask)
@@ -123,6 +176,18 @@ def verify_requests(lm, inputs, caches, rope_deltas=None):
         positions = positions.reshape(1, -1)
         if lm._position_ids is not None and lm._position_ids.ndim == 3:
             positions = mx.broadcast_to(positions[None], (3, 1, batch * width))
+        if batch == 1:
+            # Keep the established singleton verifier when an admission-capable
+            # scheduler has just one active request. Positions remain explicit
+            # so another request's prefill cannot change this row's RoPE state.
+            result = lm._verification_forward(1, width)(
+                lm,
+                inputs,
+                cache=caches[0],
+                position_ids=positions,
+                skip_logits=True,
+            )
+            return result.hidden_states[-1], transactions
         mixed = getattr(lm, "_mixed_verifier", None) is not None
         name = "_independent_mixed_verifier" if mixed else "_independent_exact_verifier"
         forward = getattr(lm, name, None)

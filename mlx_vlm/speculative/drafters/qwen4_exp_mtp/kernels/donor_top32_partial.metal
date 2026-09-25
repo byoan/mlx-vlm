@@ -9,6 +9,7 @@ constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
 static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
 static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
 
+uint row = threadgroup_position_in_grid.y;
 uint tile = threadgroup_position_in_grid.x;
 uint tid  = thread_position_in_threadgroup.x;
 uint lane = thread_index_in_simdgroup;
@@ -19,7 +20,7 @@ uint idx[PER_THREAD];
 for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
 uint n = 0;
 for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
-    ord[n] = msv_top32_ordinal(float(logits[i]));
+    ord[n] = msv_top32_ordinal(float(logits[row * REAL_COUNT + i]));
     idx[n] = i;
     n++;
 }
@@ -71,8 +72,8 @@ if (sg == 0) {
             tk2 |= (1u << bs);
         }
         if (lane == 0) {
-            cand_ord[tile * TOPK + r] = mo;
-            cand_idx[tile * TOPK + r] = mi;
+            cand_ord[row * 2048 + tile * TOPK + r] = mo;
+            cand_idx[row * 2048 + tile * TOPK + r] = mi;
         }
     }
 }

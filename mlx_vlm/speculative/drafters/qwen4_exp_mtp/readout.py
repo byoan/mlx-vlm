@@ -28,24 +28,27 @@ def kernels():
 
 
 def top32(logits):
-    if logits.ndim != 1 or not 16384 <= logits.size <= 524288:
-        raise ValueError("Donor top32 expects a single row of 16384..524288 scores")
+    """Select each row independently, preserving the singleton tie order."""
+    if logits.ndim not in (1, 2) or not 16384 <= logits.shape[-1] <= 524288:
+        raise ValueError("Donor top32 expects rows of 16384..524288 scores")
+    batch = 1 if logits.ndim == 1 else logits.shape[0]
     partial, final = kernels()
     intermediate = partial(
         inputs=[logits],
-        template=[("RC", logits.size)],
-        grid=(16384, 1, 1),
+        template=[("RC", logits.shape[-1])],
+        grid=(16384, batch, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(2048,), (2048,)],
+        output_shapes=[(batch, 2048), (batch, 2048)],
         output_dtypes=[mx.uint32, mx.uint32],
     )
-    return final(
+    result = final(
         inputs=intermediate,
-        grid=(256, 1, 1),
+        grid=(256, batch, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(32,)],
+        output_shapes=[(batch, 32)],
         output_dtypes=[mx.uint32],
     )[0]
+    return result[0] if logits.ndim == 1 else result
 
 
 class FoldedRMSNorm(nn.Module):
@@ -137,4 +140,59 @@ class Qwen4DraftReadout:
             group_size=64,
             mode="affine",
         ).reshape(-1)
+        return logits, ids
+
+    def logits_batch(self, x, *, exact=False):
+        """Batched approximate Q3 proposals; retain Q8 scores for rejection sampling.
+
+        The larger Q3 matrix multiply can round differently from singleton
+        QMV. It changes the proposal distribution, not target verification.
+        """
+        if x.ndim != 3 or x.shape[1] != 1 or x.shape[0] < 1:
+            raise ValueError("Expected one hidden token per request")
+        if x.shape[0] == 1:
+            scores, ids = self.logits(x)
+            return scores[None], ids[None]
+        batch = x.shape[0]
+        if exact:
+            coarse = mx.concatenate(
+                [
+                    mx.quantized_matmul(
+                        x[i].reshape(1, -1),
+                        self.weight,
+                        self.scales,
+                        self.biases,
+                        transpose=True,
+                        bits=3,
+                        group_size=64,
+                        mode="affine",
+                    )[:, : self.vocab_size]
+                    for i in range(batch)
+                ]
+            )
+        else:
+            coarse = mx.quantized_matmul(
+                x.reshape(batch, -1),
+                self.weight,
+                self.scales,
+                self.biases,
+                transpose=True,
+                bits=3,
+                group_size=64,
+                mode="affine",
+            )[:, : self.vocab_size]
+        ids = top32(mx.contiguous(coarse))
+        h = self.head
+        # Per-request selected rows use batched QMV rather than flattening
+        # unrelated shortlist IDs into a common vocabulary matrix.
+        logits = mx.quantized_matmul(
+            x,
+            h.weight[ids],
+            h.scales[ids],
+            h.biases[ids],
+            transpose=True,
+            bits=8,
+            group_size=64,
+            mode="affine",
+        ).reshape(batch, 32)
         return logits, ids
